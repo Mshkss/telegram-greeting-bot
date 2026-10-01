@@ -1,20 +1,57 @@
+x-app: &app
+  build: .
+  env_file:
+    - .env
+  environment:
+    POSTGRES_HOST: db
+    POSTGRES_PORT: 5432
+    ADMIN_HOST: 0.0.0.0
+  depends_on:
+    db:
+      condition: service_healthy
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 45s
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m,mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
 services:
-  bot:
-    build: .
-    env_file:
-      - .env
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dating}
+      POSTGRES_USER: ${POSTGRES_USER:-dating}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", 'pg_isready -U "$${POSTGRES_USER}" -d "$${POSTGRES_DB}"']
+      interval: 5s
+      timeout: 5s
+      retries: 15
     restart: unless-stopped
-    init: true
-    stop_grace_period: 45s
-    read_only: true
-    tmpfs:
-      - /tmp:size=16m,mode=1777
-    security_opt:
-      - no-new-privileges:true
-    cap_drop:
-      - ALL
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+  bot:
+    <<: *app
+  admin:
+    <<: *app
+    command: ["python", "-m", "app.admin"]
+    ports:
+      - "${ADMIN_BIND:-127.0.0.1}:${ADMIN_PORT:-8080}:8080"
+
+volumes:
+  postgres_data:
