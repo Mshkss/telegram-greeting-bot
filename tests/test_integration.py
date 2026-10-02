@@ -277,7 +277,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 4)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 5)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -529,3 +529,109 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         rows = await self.db.pool.fetch('SELECT user_id,display_name,username FROM analytics_users ORDER BY user_id')
         self.assertEqual([r['display_name'] for r in rows],['Current','Deleted','Draft'])
         self.assertEqual(rows[2]['username'],'draft_user')
+
+    async def test_personal_history_onboarding_attempts_and_deletion(self):
+        from app.analytics import ActivityMiddleware
+        from app.reports import user_history_report
+        self.dp.update.outer_middleware(ActivityMiddleware(self.db))
+        await self.send('/start itmo_chat')
+        await self.click_draft('agree')
+        await self.click_draft('male')
+        await self.send('17')
+        await self.send('/start stranger_source',uid=99)
+        auth = {'Authorization': 'Basic ' + base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            self.assertEqual((await client.get('/users/42')).status,401)
+            response = await client.get('/users/42',headers=auth)
+            self.assertEqual(response.status,200)
+            body = await response.text()
+            for text in ('Подтвердил 18+ → Указал пол','Ожидается: Возраст','itmo_chat','Ошибки заполнения'):
+                self.assertIn(text,body)
+            self.assertNotIn('stranger_source',body)
+            for path in ('/users/0','/users/nope','/users/999999999999999999999','/users/1234'):
+                self.assertEqual((await client.get(path,headers=auth)).status,404)
+            for path in ('/users/42?events_page=0','/users/42?attempts_page=oops','/users/42?from=bad'):
+                self.assertEqual((await client.get(path,headers=auth)).status,400)
+            await self.send('/cancel')
+            await self.send('/start')
+            await self.click_draft('agree')
+            await self.click_draft('male')
+            await self.send('25')
+            await self.send(photo=True)
+            await self.send('О себе')
+            await self.click_draft('goal_friends')
+            await self.click_draft('done')
+            await self.click_draft('publish')
+            await self.send('/edit')
+            await self.send('/cancel')
+            await self.db.delete(42)
+            report = await user_history_report(self.db,42)
+            self.assertEqual(report['attempts']['total'],3)
+            attempts = report['attempts']['rows']
+            self.assertEqual([a['status'] for a in attempts],['cancelled','published','cancelled'])
+            self.assertTrue(attempts[0]['is_edit'])
+            self.assertFalse(attempts[1]['is_edit'])
+            self.assertIsNone(report['user']['active'])
+            self.assertTrue(report['user']['has_archive'])
+            body = await (await client.get('/users/42',headers=auth)).text()
+            self.assertIn('Опубликовал',body)
+            self.assertIn('Редактирование / повторная анкета',body)
+            self.assertIn('/archive?q=42',body)
+            self.assertIn('Анкета удалена',body)
+            listing = await (await client.get('/users',headers=auth)).text()
+            self.assertIn('href="/users/42"',listing)
+
+    async def test_personal_history_related_matches_errors_and_escape(self):
+        from app.reports import user_history_report
+        from app.admin_user import history_html
+        from app.analytics import CONTEXT
+        context = await self.db.begin_update(101,42,'browse',display_name='<script>name</script>')
+        await self.db.begin_update(102,43,'message',display_name='Other')
+        await self.db.finish_update(101,12,'HandlerFailure')
+        token = CONTEXT.set(context)
+        try:
+            await self.db.track('telegram_call',42,{'method':'sendPhoto','ok':False,'error_type':'DeliveryFailure',
+                'duration_ms':10,'channel':'bot','recipient_id':42,'secret':'DO_NOT_RENDER'})
+            await self.db.track('profile_viewed',42,{'target_id':43})
+        finally:
+            CONTEXT.reset(token)
+        await self.db.track('match_created',43,{'target_id':42})
+        await self.db.track('telegram_call',43,{'method':'sendMessage','ok':False,'error_type':'RecipientFailure',
+            'duration_ms':5,'channel':'bot','recipient_id':42})
+        await self.db.track('telegram_call',43,{'method':'sendMessage','ok':False,'error_type':'OtherFailure','recipient_id':43})
+        await self.db.track('start_repeat',42,{'source':'<img src=x>'})
+        report = await user_history_report(self.db,42)
+        self.assertEqual(report['updates']['total'],1)
+        self.assertEqual(report['errors']['total'],3)
+        self.assertEqual([r['total'] for r in report['counts'] if r['name']=='match_created'],[1])
+        body = history_html(report)
+        for value in ('HandlerFailure','DeliveryFailure','RecipientFailure','Взаимная симпатия','/users/43','&lt;script&gt;name&lt;/script&gt;','&lt;img src=x&gt;'):
+            self.assertIn(value,body)
+        for value in ('OtherFailure','DO_NOT_RENDER','<script>','<img src=x>'):
+            self.assertNotIn(value,body)
+
+    async def test_personal_history_dates_sessions_and_independent_pagination(self):
+        from datetime import datetime,date,timedelta,timezone
+        from app.reports import user_history_report
+        t = datetime(2026,1,1,20,59,tzinfo=timezone.utc)
+        await self.db.begin_update(101,42,'start','early',at=t)
+        await self.db.finish_update(101,5)
+        await self.db.begin_update(102,42,'start','late',at=t+timedelta(minutes=2))
+        await self.db.finish_update(102,6)
+        report = await user_history_report(self.db,42,date(2026,1,2),date(2026,1,2))
+        self.assertEqual(report['updates']['total'],1)
+        self.assertEqual(report['events']['total'],2)
+        self.assertEqual(report['sessions']['total'],1)
+        self.assertEqual(report['sessions']['rows'][0]['actions'],2)  # Entire overlapping session.
+        for n in range(31):
+            await self.db.track('profile_skipped',42,{'target_id':1000+n})
+        first = await user_history_report(self.db,42)
+        second = await user_history_report(self.db,42,pages={'events':2})
+        self.assertEqual((first['events']['total'],len(first['events']['rows']),len(second['events']['rows'])),(35,30,5))
+        self.assertFalse({r['id'] for r in first['events']['rows']} & {r['id'] for r in second['events']['rows']})
+        self.assertEqual(first['sessions'],second['sessions'])
+        self.assertEqual((await user_history_report(self.db,42,pages={'events':999}))['events']['page'],2)
+        await self.db.pool.execute('INSERT INTO analytics_users(user_id,known_before_tracking) VALUES(44,true)')
+        empty = await user_history_report(self.db,44)
+        self.assertEqual(empty['events']['total'],0)
+        self.assertEqual(empty['updates']['total'],0)

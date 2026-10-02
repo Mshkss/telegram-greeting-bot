@@ -146,3 +146,59 @@ async def users_report(db, query='', page=1, start=None, end=None):
                 ORDER BY u.last_seen DESC NULLS LAST,u.user_id DESC LIMIT 30 OFFSET $4""",
                 query,start,end,(page-1)*30)
     return {'total':total,'rows':rows,'page':page,'pages':pages}
+
+
+async def user_history_report(db, user_id, start=None, end=None, pages=None):
+    """A user's history, with independently paginated sections and a consistent snapshot."""
+    pages = pages or {}
+    lo = datetime.combine(start, time.min, MOSCOW) if start else None
+    hi = datetime.combine(end+timedelta(days=1), time.min, MOSCOW) if end else None
+    report = {'start':start, 'end':end}
+    async with db.pool.acquire() as c:
+        async with c.transaction(isolation='repeatable_read', readonly=True):
+            user = await c.fetchrow("""SELECT u.*,p.active,coalesce(m.blocked,false) AS blocked,
+                EXISTS(SELECT 1 FROM profile_archives a WHERE a.user_id=u.user_id) AS has_archive
+                FROM analytics_users u LEFT JOIN profiles p USING(user_id)
+                LEFT JOIN user_moderation m USING(user_id) WHERE u.user_id=$1""", user_id)
+            if user is None:
+                return None
+            report['user'] = user
+            report['tracking_since'] = await c.fetchval('SELECT applied_at FROM schema_migrations WHERE version=3')
+            report['updates'] = await c.fetchrow("""SELECT count(*) AS total,
+                count(*) FILTER(WHERE status='error') AS errors,
+                count(*) FILTER(WHERE status='processing') AS processing,
+                percentile_cont(0.95) WITHIN GROUP(ORDER BY duration_ms) AS p95
+                FROM analytics_updates WHERE user_id=$1
+                AND ($2::timestamptz IS NULL OR received_at >= $2 AND received_at < $3)""", user_id,lo,hi)
+            # The second participant also sees the match. Incoming likes are not their actions.
+            event_where = """WHERE name<>'telegram_call'
+                AND (user_id=$1 OR name='match_created' AND properties->>'target_id'=$1::bigint::text)
+                AND ($2::timestamptz IS NULL OR occurred_at >= $2 AND occurred_at < $3)"""
+            report['counts'] = await c.fetch('SELECT name,count(*) AS total FROM analytics_events '+event_where+' GROUP BY name',user_id,lo,hi)
+            queries = {
+                'attempts': ("""SELECT * FROM analytics_attempts WHERE user_id=$1
+                    AND ($2::timestamptz IS NULL OR started_at >= $2 AND started_at < $3)""", 'started_at DESC,id DESC'),
+                'events': ('SELECT * FROM analytics_events '+event_where, 'occurred_at DESC,id DESC'),
+                'sessions': ("""SELECT * FROM analytics_sessions WHERE user_id=$1
+                    AND ($2::timestamptz IS NULL OR started_at < $3 AND last_activity >= $2)""", 'started_at DESC,id DESC'),
+                'errors': ("""SELECT update_id AS id,received_at AS at,'handler' AS kind,action AS operation,
+                    error_type,duration_ms,session_id,NULL::bigint AS recipient_id,'bot' AS channel
+                    FROM analytics_updates WHERE user_id=$1 AND status='error'
+                    AND ($2::timestamptz IS NULL OR received_at >= $2 AND received_at < $3)
+                    UNION ALL
+                    SELECT id,occurred_at,'telegram',properties->>'method',properties->>'error_type',
+                    (properties->>'duration_ms')::double precision,
+                    CASE WHEN user_id=$1 THEN session_id END,
+                    (properties->>'recipient_id')::bigint,properties->>'channel'
+                    FROM analytics_events WHERE name='telegram_call' AND properties->>'ok'='false'
+                    AND (user_id=$1 OR properties->>'recipient_id'=$1::bigint::text)
+                    AND ($2::timestamptz IS NULL OR occurred_at >= $2 AND occurred_at < $3)""", 'at DESC,kind,id DESC'),
+            }
+            for key,(sql,order) in queries.items():
+                total = await c.fetchval('SELECT count(*) FROM ('+sql+') records',user_id,lo,hi)
+                max_page = max(1,(total+29)//30)
+                current = min(max(1,pages.get(key,1)),max_page)
+                rows = await c.fetch('SELECT * FROM ('+sql+') records ORDER BY '+order+' LIMIT 30 OFFSET $4',
+                    user_id,lo,hi,(current-1)*30)
+                report[key] = {'rows':rows,'total':total,'page':current,'pages':max_page}
+    return report

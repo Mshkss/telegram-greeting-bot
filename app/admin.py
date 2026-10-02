@@ -36,7 +36,7 @@ STYLE = '''
 main{max-width:1120px;margin:40px auto;padding:0 24px}header{display:flex;justify-content:space-between;align-items:center;gap:16px}
 h1{font-size:32px;line-height:1.2}h2{margin-top:0}a{color:#b6bcff;text-decoration:none}a:hover{text-decoration:underline}
 .muted{color:#a5abba}.card{background:#1a1f29;border:1px solid #303847;border-radius:16px;padding:24px;margin:20px 0}
-.stats{display:flex;gap:24px}.stats strong{font-size:28px;display:block}form{display:flex;gap:12px;margin:24px 0}
+.stats{display:flex;gap:24px}.stats strong{font-size:28px;display:block}form{display:flex;flex-wrap:wrap;gap:12px;margin:24px 0}
 input,button,textarea,select{border:1px solid #424c60;border-radius:10px;padding:12px 16px;font:inherit}input,textarea,select{background:#101319;color:white;flex:1;min-width:0}
 button{background:#b6bcff;color:#11142b;cursor:pointer}table{border-collapse:collapse;width:100%;text-align:left}td,th{padding:14px 12px;border-bottom:1px solid #303847}th{color:#a5abba;font-weight:500}
 .scroll{overflow:auto}.badge{display:inline-block;background:#303647;border-radius:16px;padding:2px 10px;font-size:13px;white-space:nowrap}
@@ -148,6 +148,7 @@ async def detail(request):
     return page(p['name'], f'''<nav><a href="/profiles">← Все анкеты</a></nav><div class="card profile">
 <div><img src="/profiles/{p['user_id']}/photo" alt="Фото анкеты"></div><div>
 <h1>{esc(p['name'])}, {p['age']}</h1><span class="badge">{profile_status(p)}</span>
+<p><a href="/users/{p['user_id']}">Действия и попытки пользователя →</a></p>
 <dl><dt>Telegram ID</dt><dd>{p['user_id']}</dd><dt>Username</dt><dd>{esc('@'+p['username'] if p['username'] else 'Не задан')}</dd>
 <dt>Пол</dt><dd>{esc(GENDERS[p['gender']])}</dd>
 <dt>Создана, UTC</dt><dd>{p['created_at'].strftime('%d.%m.%Y %H:%M')}</dd>
@@ -315,6 +316,7 @@ async def archive_detail(request):
     record = await get_archive(request)
     aid, uid = record['id'], record['user_id']
     content = f"<h1>Удалённая анкета #{aid}</h1><p>Telegram ID: {uid} · Удалена {record['deleted_at'].strftime('%d.%m.%Y %H:%M')} UTC</p>"
+    content += f'<p><a href="/users/{uid}">Действия и попытки пользователя →</a></p>'
     if record['profile_snapshot']:
         content += archive_snapshot(record['profile_snapshot'], f'/archive/{aid}/photo', 'Сохранённая анкета на момент удаления')
     if record['draft_snapshot']:

@@ -85,6 +85,16 @@ FROM (
 CREATE INDEX analytics_users_last_seen_idx ON analytics_users(last_seen DESC NULLS LAST,user_id DESC);
 """))
 
+MIGRATIONS.append((5, """
+CREATE INDEX analytics_attempts_user_idx ON analytics_attempts(user_id,started_at DESC,id DESC);
+CREATE INDEX analytics_sessions_user_idx ON analytics_sessions(user_id,started_at DESC,id DESC);
+CREATE INDEX analytics_updates_user_idx ON analytics_updates(user_id,received_at DESC);
+CREATE INDEX analytics_events_match_target_idx ON analytics_events((properties->>'target_id'),occurred_at DESC)
+    WHERE name='match_created';
+CREATE INDEX analytics_events_failed_recipient_idx ON analytics_events((properties->>'recipient_id'),occurred_at DESC)
+    WHERE name='telegram_call' AND properties->>'ok'='false';
+"""))
+
 PROFILE_SELECT = """SELECT p.*, coalesce(m.blocked,false) AS blocked,
     coalesce(m.reason,'') AS moderation_reason FROM profiles p
     LEFT JOIN user_moderation m ON m.user_id=p.user_id """

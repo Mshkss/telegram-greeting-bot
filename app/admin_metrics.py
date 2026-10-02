@@ -179,7 +179,7 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
                 state.append('Нет анкеты')
             if user['has_archive']:
                 state.append(f'<a href="/archive?q={uid}">Архив</a>')
-            rows.append((f'<code>{uid}</code>',esc(user['display_name'] or '—'),
+            rows.append((f'<a href="/users/{uid}"><code>{uid}</code></a>',esc(user['display_name'] or '—'),
                 esc('@'+user['username']) if user['username'] else '—',
                 esc(user['first_source'] or 'unknown'),esc(user['last_source'] or 'unknown'),
                 stamp(user['first_seen']),stamp(user['last_seen']),user['start_count'],' · '.join(state)))
@@ -249,3 +249,6 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
 
     app.add_routes([web.get('/',dashboard),web.get('/dashboard',dashboard),web.get('/analytics/daily.csv',daily_csv),
                     web.get('/users',users),web.get('/settings',settings_page),web.post('/settings',save_settings)])
+
+    from app.admin_user import register_user_pages
+    register_user_pages(app, db_key, page)
