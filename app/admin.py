@@ -42,7 +42,7 @@ button{background:#b6bcff;color:#11142b;cursor:pointer}table{border-collapse:col
 .scroll{overflow:auto}.badge{display:inline-block;background:#303647;border-radius:16px;padding:2px 10px;font-size:13px;white-space:nowrap}
 .moderation{display:block}.moderation textarea{display:block;width:100%;margin:12px 0;min-height:90px}.danger{background:#f4a0a0}.history{font-size:14px}.profile{display:grid;grid-template-columns:minmax(200px,360px) 1fr;gap:28px}img{max-width:100%;border-radius:12px;max-height:560px;object-fit:contain}
 .description{white-space:pre-wrap;overflow-wrap:anywhere}dl{display:grid;grid-template-columns:140px 1fr;gap:10px}dt{color:#a5abba}dd{margin:0;overflow-wrap:anywhere}
-nav{display:flex;gap:24px;margin:24px 0}@media(max-width:650px){.profile{grid-template-columns:1fr}header{display:block}dl{grid-template-columns:1fr}main{padding:0 16px}}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:14px;margin:20px 0}.metric{padding:18px;background:#151923;border:1px solid #303847;border-radius:12px}.metric strong{display:block;font-size:28px}.metric small{display:block;color:#a5abba;margin-top:8px}.meter{width:130px;height:9px;background:#303847;border-radius:5px}.meter i{display:block;height:100%;background:#a9b3ff;border-radius:5px}.bars{display:flex;align-items:flex-end;height:150px;gap:3px}.barcol{height:100%;flex:1;display:flex;align-items:flex-end;min-width:1px}.bar{background:#a9b3ff;width:100%;border-radius:3px 3px 0 0}details{margin:20px 0}summary{cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}nav{display:flex;flex-wrap:wrap;gap:24px;margin:24px 0}@media(max-width:650px){.profile{grid-template-columns:1fr}header{display:block}dl{grid-template-columns:1fr}main{padding:0 16px}}
 '''
 
 
@@ -50,7 +50,7 @@ def page(title, content):
     return web.Response(text=f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Знакомства</title>
 <style>{STYLE}</style></head><body><main><header><a href="/">💘 Знакомства / Админка</a>
-<nav><a href="/">Анкеты</a><a href="/archive">Архив удалённых</a></nav></header>{content}</main></body></html>''', content_type='text/html')
+<nav><a href="/dashboard">Дашборд</a><a href="/profiles">Анкеты</a><a href="/settings">Настройки</a></nav></header>{content}</main></body></html>''', content_type='text/html')
 
 
 def auth_middleware(username, password):
@@ -114,11 +114,11 @@ async def index(request):
 <td>{p['created_at'].strftime('%d.%m.%Y')}</td></tr>''' for p in profiles)
     nav = ''
     if number > 1:
-        nav += f'<a href="/?{esc(urlencode(dict(q=query,status=status,page=number-1)))}">← Назад</a>'
+        nav += f'<a href="/profiles?{esc(urlencode(dict(q=query,status=status,page=number-1)))}">← Назад</a>'
     if number*30 < total:
-        nav += f'<a href="/?{esc(urlencode(dict(q=query,status=status,page=number+1)))}">Далее →</a>'
+        nav += f'<a href="/profiles?{esc(urlencode(dict(q=query,status=status,page=number+1)))}">Далее →</a>'
     options = ''.join(f'<option value="{key}" {"selected" if key == status else ""}>{label}</option>' for key, label in [('all','Все анкеты'),('active','В поиске'),('hidden','Скрытые'),('blocked','Заблокированные')])
-    return page('Анкеты', f'''<h1>Анкеты участников</h1><div class="stats">
+    return page('Анкеты', f'''<nav><a href="/profiles">Текущие анкеты</a><a href="/archive">Архив удалённых</a></nav><h1>Анкеты участников</h1><div class="stats">
 <div><strong>{total}</strong><span class="muted">{'Найдено анкет' if query else 'Сохранённых анкет'}</span></div>
 <div><strong>{drafts}</strong><span class="muted">Незавершённых анкет</span></div></div>
 <form method="get"><input name="q" value="{esc(query)}" placeholder="Имя, username или Telegram ID" aria-label="Поиск">
@@ -145,7 +145,7 @@ async def detail(request):
     p = await get_profile(request)
     goals = ''.join(f'<li>{esc(GOALS[g])}</li>' for g in p['goals'])
     moderation = await moderation_panel(request, p['user_id'], f"/profiles/{p['user_id']}/moderation")
-    return page(p['name'], f'''<nav><a href="/">← Все анкеты</a></nav><div class="card profile">
+    return page(p['name'], f'''<nav><a href="/profiles">← Все анкеты</a></nav><div class="card profile">
 <div><img src="/profiles/{p['user_id']}/photo" alt="Фото анкеты"></div><div>
 <h1>{esc(p['name'])}, {p['age']}</h1><span class="badge">{profile_status(p)}</span>
 <dl><dt>Telegram ID</dt><dd>{p['user_id']}</dd><dt>Username</dt><dd>{esc('@'+p['username'] if p['username'] else 'Не задан')}</dd>
@@ -331,7 +331,7 @@ def create_app(settings, db=None, bot=None):
 
     async def resources(app):
         database = db or await Database.connect(settings)
-        telegram = bot or create_bot(settings)
+        telegram = bot or create_bot(settings, database, channel='admin')
         app[DB], app[BOT] = database, telegram
         try:
             await database.initialize()
@@ -344,10 +344,12 @@ def create_app(settings, db=None, bot=None):
     app[CSRF_KEY] = secrets.token_bytes(32)
     app[ADMIN_USER] = settings.admin_user
     app.cleanup_ctx.append(resources)
-    app.add_routes([web.get('/', index), web.get('/profiles/{uid}', detail),
+    app.add_routes([web.get('/profiles', index), web.get('/profiles/{uid}', detail),
         web.get('/profiles/{uid}/photo', photo), web.post('/profiles/{uid}/moderation', moderate),
         web.get('/archive', archive_index), web.get('/archive/{aid}', archive_detail),
         web.get('/archive/{aid}/photo', photo), web.post('/archive/{aid}/moderation', moderate)])
+    from app.admin_metrics import register_metrics
+    register_metrics(app, DB, ADMIN_USER, page, csrf_token, check_csrf)
     return app
 
 

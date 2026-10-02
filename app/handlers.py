@@ -37,7 +37,8 @@ async def prompt(message, draft):
             'при взаимном лайке. Фото хранится в Telegram; мы сохраняем его идентификатор.\n\n'
             'Продолжая, вы подтверждаете совершеннолетие и соглашаетесь на хранение данных '
             'и показ анкеты. После удаления копии анкеты и текущего черновика остаются '
-            'в закрытом архиве администратора. /cancel — отменить черновик, /delete — убрать анкету из бота.',
+            'в закрытом архиве администратора. Мы также учитываем действия в боте '
+            'для статистики работы сервиса. /cancel — отменить черновик, /delete — убрать анкету из бота.',
             reply_markup=keyboard([[('Мне есть 18, продолжить', cb('agree'))]]))
     elif step == 'gender':
         await message.answer('Ты парень или девушка?', reply_markup=keyboard([
@@ -88,12 +89,14 @@ async def browse(message, db, uid):
         return
     candidate = await db.candidate(uid)
     if not candidate:
+        await db.track('browse_empty', uid)
         await message.answer('Пока нет новых анкет с общими целями. Загляни позже.', reply_markup=menu())
         return
     await message.answer_photo(candidate['photo_file_id'], caption=caption(candidate),
         reply_markup=keyboard([[
             ('❤️ Нравится', f"react:{candidate['user_id']}:like"),
             ('Дальше →', f"react:{candidate['user_id']}:skip")]]))
+    await db.track('profile_viewed', uid, {'target_id': candidate['user_id']})
 
 
 def contact_keyboard(profile):
@@ -126,6 +129,10 @@ def build_router(db):
         if name == 'profile':
             await show_profile(message, db, uid)
         elif name == 'edit':
+            if not (await db.settings())['registrations_open'] and not await db.profile(uid):
+                await db.track('registration_paused', uid)
+                await message.answer('Регистрация новых анкет временно приостановлена. Загляни позже.')
+                return
             state = await db.moderation(uid)
             if state['blocked']:
                 await message.answer('Можно исправить анкету, но блокировку снимает администратор. Причина: ' + state['reason'])
@@ -154,6 +161,7 @@ def build_router(db):
     async def start(message: Message):
         draft = await db.draft(message.from_user.id)
         if draft:
+            await db.track('profile_fill_resumed', message.from_user.id)
             await message.answer('Продолжим заполнение. /cancel — отменить черновик.')
             await prompt(message, draft)
         elif await db.profile(message.from_user.id):
@@ -192,6 +200,7 @@ def build_router(db):
         uid = callback.from_user.id
         draft = await db.draft(uid)
         if not draft or draft['version'] != version:
+            await db.track('stale_button', uid)
             await callback.answer('Эта кнопка устарела. Нажми /start.', show_alert=True)
             return
         step, data = draft['step'], draft['data']
@@ -213,6 +222,7 @@ def build_router(db):
             return
         elif step == 'goals' and value == 'done':
             if not data['goals']:
+                await db.track('validation_error', uid, {'step': 'goals'})
                 await callback.answer('Выбери хотя бы один вариант.', show_alert=True)
                 return
             validate_profile(data)
@@ -272,12 +282,14 @@ def build_router(db):
         if step == 'age':
             text = (message.text or '').strip()
             if not text.isascii() or not text.isdigit() or not 18 <= int(text) <= 100:
+                await db.track('validation_error', uid, {'step': 'age'})
                 await message.answer('Нужно число от 18 до 100. Бот только для совершеннолетних.')
                 return
             data['age'] = int(text)
             next_step = 'photo'
         elif step == 'photo':
             if not message.photo:
+                await db.track('validation_error', uid, {'step': 'photo'})
                 await message.answer('Отправь фото через «Фото», не документом.')
                 return
             data['photo_file_id'] = message.photo[-1].file_id
@@ -285,6 +297,7 @@ def build_router(db):
         elif step == 'description':
             description = (message.text or '').strip()
             if not 1 <= len(description) <= 500:
+                await db.track('validation_error', uid, {'step': 'description'})
                 await message.answer('Нужен текст от 1 до 500 символов.')
                 return
             data['description'] = description

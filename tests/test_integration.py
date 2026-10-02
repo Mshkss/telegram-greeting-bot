@@ -53,7 +53,8 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             admin_user='admin', admin_password='correct-long-password')
         self.db = await Database.connect(self.settings)
         await self.db.initialize()
-        await self.db.pool.execute('TRUNCATE profiles,drafts,reactions,profile_archives,user_moderation,moderation_events CASCADE')
+        await self.db.pool.execute('TRUNCATE profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts CASCADE')
+        await self.db.pool.execute('UPDATE app_settings SET registrations_open=true')
         self.session = ProxySession('https://proxy.example', 'test-secret')
         self.session.make_request = AsyncMock(return_value=True)
         self.bot = Bot('123456:TEST_TOKEN', session=self.session)
@@ -184,7 +185,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.headers['Cache-Control'], 'no-store')
             fake_bot.get_file.assert_not_called()
             auth = {'Authorization': 'Basic ' + base64.b64encode(b'admin:correct-long-password').decode()}
-            response = await client.get('/?q=42', headers=auth)
+            response = await client.get('/profiles?q=42', headers=auth)
             body = await response.text()
             self.assertIn('&lt;script&gt;', body)
             self.assertNotIn('<script>alert', body)
@@ -200,7 +201,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn('TEST_TOKEN', await response.text())
             self.assertEqual((await client.get('/profiles/999', headers=auth)).status, 404)
             self.assertEqual((await client.get('/profiles/99999999999999999999999999', headers=auth)).status, 404)
-            response = await client.get('/?q=%27%20OR%201=1--', headers=auth)
+            response = await client.get('/profiles?q=%27%20OR%201=1--', headers=auth)
             self.assertIn('Анкет пока нет', await response.text())
 
     async def test_admin_login_throttle(self):
@@ -272,11 +273,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_database_migration_is_idempotent_and_concurrent(self):
         await self.publish(42)
         # Simulate the previous production schema, retaining the actual profile.
-        await self.db.pool.execute('DROP TABLE profile_archives,user_moderation,moderation_events,schema_migrations')
+        await self.db.pool.execute('DROP TABLE profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 2)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 3)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -327,3 +328,143 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 200)
             self.assertIn('Фото не загружено', await response.text())
             self.assertEqual((await client.get(f'/archive/{draft_id}/photo', headers=auth)).status, 404)
+
+    async def test_analytics_sessions_boundary_sources_and_deduplication(self):
+        from datetime import datetime, timedelta, timezone
+        t = datetime(2026,1,1,12,tzinfo=timezone.utc)
+        a = await self.db.begin_update(1001, 201, 'start', 'poster', t)
+        self.assertIsNone(await self.db.begin_update(1001,201,'start','other',t))
+        b = await self.db.begin_update(1002,201,'message',at=t+timedelta(minutes=29))
+        c = await self.db.begin_update(1003,201,'start','chat',t+timedelta(minutes=59))
+        self.assertEqual(a['session_id'],b['session_id'])
+        self.assertNotEqual(a['session_id'],c['session_id'])
+        user = await self.db.pool.fetchrow('SELECT * FROM analytics_users WHERE user_id=201')
+        self.assertEqual(user['start_count'],2)
+        self.assertEqual(user['first_source'],'poster')
+        self.assertEqual(user['last_source'],'chat')
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM analytics_sessions'),2)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='start_first'"),1)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='start_repeat'"),1)
+
+    async def test_analytics_cohorts_mature_days_and_moscow_midnight(self):
+        from datetime import datetime, timedelta, timezone, date
+        from app.reports import dashboard_report
+        t = datetime(2026,1,1,12,tzinfo=timezone.utc)
+        await self.db.pool.execute('INSERT INTO analytics_users(user_id,known_before_tracking) VALUES(203,true)')
+        for update_id,uid,day in [(1,201,0),(2,202,0),(3,203,0),(4,201,1),(5,201,7),(6,204,8)]:
+            await self.db.begin_update(update_id,uid,'start','campaign',t+timedelta(days=day))
+            await self.db.finish_update(update_id,20)
+        r = await dashboard_report(self.db,date(2026,1,1),date(2026,1,9),now=t+timedelta(days=9))
+        self.assertEqual(r['users']['new'],3)
+        self.assertEqual(r['activity']['dau'],1)
+        self.assertEqual(r['activity']['wau'],2)
+        self.assertEqual(r['activity']['mau'],4)
+        cohort = next(row for row in r['retention'] if row['day']==date(2026,1,1))
+        self.assertEqual((cohort['users'],cohort['d1'],cohort['d7']),(2,1,1))
+        recent = next(row for row in r['retention'] if row['day']==date(2026,1,9))
+        self.assertIsNone(recent['d1'])
+        self.assertIsNone(recent['d7'])
+        await self.db.begin_update(7,205,'message',at=datetime(2026,1,1,21,1,tzinfo=timezone.utc))
+        self.assertEqual(await self.db.pool.fetchval('SELECT day FROM analytics_activity_days WHERE user_id=205'), date(2026,1,2))
+
+    async def test_activity_middleware_dedup_and_technical_failure_redaction(self):
+        from app.analytics import ActivityMiddleware, TelegramMetricsMiddleware
+        from aiogram.exceptions import TelegramForbiddenError
+        self.dp.update.outer_middleware(ActivityMiddleware(self.db))
+        self.session.middleware(TelegramMetricsMiddleware(self.db))
+        await self.send('/start poster')
+        self.seq = 0
+        await self.send('/start poster')  # same Telegram update_id
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM analytics_updates'),1)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM analytics_attempts'),1)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='telegram_call'"),1)
+        self.session.make_request.side_effect = TelegramForbiddenError(method=None, message='SENSITIVE_TOKEN_AND_TEXT')
+        with self.assertRaises(TelegramForbiddenError):
+            await self.send('hello')
+        result = await self.db.pool.fetchrow('SELECT * FROM analytics_updates WHERE update_id=2')
+        self.assertEqual(result['status'],'error')
+        self.assertEqual(result['error_type'],'TelegramForbiddenError')
+        events = str(await self.db.pool.fetch('SELECT * FROM analytics_events'))
+        self.assertNotIn('SENSITIVE_TOKEN_AND_TEXT',events)
+        self.assertNotIn('hello',events)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='telegram_call' AND properties->>'ok'='false'"),1)
+
+    async def test_analytics_funnel_real_flow_and_business_events_survive_delete(self):
+        from app.analytics import ActivityMiddleware
+        self.dp.update.outer_middleware(ActivityMiddleware(self.db))
+        await self.send('/start test')
+        await self.click_draft('agree')
+        await self.click_draft('male')
+        await self.send('25')
+        await self.send(photo=True)
+        await self.send('О себе')
+        await self.click_draft('goal_friends')
+        await self.click_draft('goal_project')
+        await self.click_draft('goal_project')
+        await self.click_draft('done')
+        await self.click_draft('publish')
+        attempt = await self.db.pool.fetchrow('SELECT * FROM analytics_attempts')
+        self.assertEqual(attempt['status'],'published')
+        self.assertEqual(list(attempt['completed_steps']),['consent','gender','age','photo','description','goals','preview'])
+        self.assertFalse(attempt['is_edit'])
+        await self.send('/edit')
+        self.assertTrue(await self.db.pool.fetchval('SELECT is_edit FROM analytics_attempts WHERE status=\'in_progress\''))
+        await self.send('/cancel')
+        await self.send('/hide')
+        await self.send('/hide')
+        await self.send('/show')
+        await self.publish(43,goals=['friends'])
+        await self.db.react(42,43,True)
+        await self.db.react(42,43,True)
+        await self.db.react(43,42,True)
+        await self.db.delete(42)
+        await self.db.delete(42)
+        for event_name,total in [('profile_hidden',1),('profile_liked',2),('match_created',1),('profile_deleted',1)]:
+            self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM analytics_events WHERE name=$1',event_name),total)
+        self.assertEqual(await self.db.pool.fetchval('SELECT status FROM analytics_attempts WHERE id=$1',attempt['id']),'published')
+
+    async def test_analytics_view_only_after_delivery_and_empty_browse(self):
+        from app.handlers import browse
+        from aiogram.exceptions import TelegramForbiddenError
+        await self.publish(42)
+        await self.publish(43)
+        message = SimpleNamespace(answer_photo=AsyncMock(side_effect=TelegramForbiddenError(method=None,message='blocked')),
+                                  answer=AsyncMock())
+        with self.assertRaises(TelegramForbiddenError):
+            await browse(message,self.db,42)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='profile_viewed'"),0)
+        message.answer_photo.side_effect = None
+        await browse(message,self.db,42)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='profile_viewed'"),1)
+        await self.db.react(42,43,False)
+        await browse(message,self.db,42)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='browse_empty'"),1)
+
+    async def test_dashboard_settings_csv_and_paused_registration(self):
+        import re
+        auth = {'Authorization': 'Basic ' + base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            for path in ('/dashboard','/settings','/analytics/daily.csv'):
+                self.assertEqual((await client.get(path)).status,401)
+            response = await client.get('/',headers=auth)
+            self.assertEqual(response.status,200)
+            body = await response.text()
+            self.assertIn('Начинаем собирать данные',body)
+            self.assertIn('D7 retention',body)
+            self.assertEqual((await client.get('/?from=wrong',headers=auth)).status,400)
+            response = await client.get('/analytics/daily.csv',headers=auth)
+            self.assertEqual(response.status,200)
+            self.assertIn('date_moscow',await response.text())
+            response = await client.get('/settings',headers=auth)
+            body = await response.text()
+            token = re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            self.assertEqual((await client.post('/settings',headers=auth,data={})).status,403)
+            response = await client.post('/settings',headers=auth,data={'csrf':token},allow_redirects=False)
+            self.assertEqual(response.status,303)
+            self.assertFalse((await self.db.settings())['registrations_open'])
+            await self.send('/start')
+            self.assertIsNone(await self.db.draft(42))
+            await self.publish(42)
+            await self.send('/edit')
+            self.assertIsNotNone(await self.db.draft(42))
+            self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='settings_changed'"),1)

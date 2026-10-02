@@ -1,9 +1,11 @@
 import json
 import secrets
+from uuid import uuid4, UUID
 
 import asyncpg
 
 from app.domain import validate_profile
+from app.analytics import AnalyticsStore, SCHEMA as ANALYTICS_SCHEMA, event
 
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS profiles (
@@ -66,12 +68,14 @@ CREATE TABLE moderation_events (
 CREATE INDEX moderation_events_user_idx ON moderation_events(user_id, id DESC);
 """)]
 
+MIGRATIONS.append((3, ANALYTICS_SCHEMA))
+
 PROFILE_SELECT = """SELECT p.*, coalesce(m.blocked,false) AS blocked,
     coalesce(m.reason,'') AS moderation_reason FROM profiles p
     LEFT JOIN user_moderation m ON m.user_id=p.user_id """
 
 
-class Database:
+class Database(AnalyticsStore):
     def __init__(self, pool):
         self.pool = pool
 
@@ -109,13 +113,42 @@ class Database:
 
     async def save_draft(self, user_id, step, data):
         version = secrets.token_hex(4)
-        await self.pool.execute('''INSERT INTO drafts(user_id,step,data,version) VALUES($1,$2,$3,$4)
-            ON CONFLICT(user_id) DO UPDATE SET step=$2,data=$3,version=$4,updated_at=now()''',
-            user_id, step, json.dumps(data), version)
-        return {'step': step, 'data': data, 'version': version}
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute('SELECT pg_advisory_xact_lock($1)', user_id)
+                old = await conn.fetchrow('SELECT * FROM drafts WHERE user_id=$1 FOR UPDATE', user_id)
+                attempt_id = old['attempt_id'] if old else None
+                if step == 'consent' or attempt_id is None:
+                    if attempt_id:
+                        await conn.execute("UPDATE analytics_attempts SET status='restarted',last_activity=now() WHERE id=$1", attempt_id)
+                        await event(conn, 'profile_fill_restarted', user_id, {'attempt_id': str(attempt_id)})
+                    is_edit = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM profiles WHERE user_id=$1)
+                        OR EXISTS(SELECT 1 FROM profile_archives WHERE user_id=$1 AND profile_snapshot IS NOT NULL)""", user_id)
+                    attempt_id = uuid4()
+                    legacy = bool(old and old['attempt_id'] is None and step != 'consent')
+                    await conn.execute("""INSERT INTO analytics_attempts(id,user_id,is_edit,legacy,last_step)
+                        VALUES($1,$2,$3,$4,$5)""", attempt_id, user_id, is_edit, legacy, step)
+                    await event(conn, 'profile_fill_started', user_id,
+                        {'attempt_id': str(attempt_id), 'is_edit': is_edit, 'legacy': legacy}, f'attempt:{attempt_id}')
+                if old and old['step'] != step and step != 'consent':
+                    await conn.execute("""UPDATE analytics_attempts SET completed_steps=array_append(completed_steps,$2)
+                        WHERE id=$1 AND NOT ($2=ANY(completed_steps))""", attempt_id, old['step'])
+                    await event(conn, 'profile_step_completed', user_id,
+                        {'attempt_id': str(attempt_id), 'step': old['step']}, f'step:{attempt_id}:{old["step"]}')
+                await conn.execute('UPDATE analytics_attempts SET last_step=$2,last_activity=now() WHERE id=$1', attempt_id, step)
+                await conn.execute("""INSERT INTO drafts(user_id,step,data,version,attempt_id) VALUES($1,$2,$3,$4,$5)
+                    ON CONFLICT(user_id) DO UPDATE SET step=$2,data=$3,version=$4,attempt_id=$5,updated_at=now()""",
+                    user_id, step, json.dumps(data), version, attempt_id)
+        return {'step': step, 'data': data, 'version': version, 'attempt_id': attempt_id}
 
     async def cancel(self, user_id):
-        await self.pool.execute('DELETE FROM drafts WHERE user_id=$1', user_id)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow('DELETE FROM drafts WHERE user_id=$1 RETURNING attempt_id', user_id)
+                if row:
+                    if row['attempt_id']:
+                        await conn.execute("UPDATE analytics_attempts SET status='cancelled',last_activity=now() WHERE id=$1", row['attempt_id'])
+                    await event(conn, 'profile_fill_cancelled', user_id)
 
     async def publish(self, user_id, version):
         async with self.pool.acquire() as conn:
@@ -133,11 +166,23 @@ class Database:
                     photo_file_id=$6,description=$7,goals=$8,active=true,updated_at=now()''',
                     user_id, data.get('username'), data['name'], data['gender'], data['age'],
                     data['photo_file_id'], data['description'], data['goals'])
+                attempt_id = row['attempt_id']
+                if attempt_id:
+                    await conn.execute("""UPDATE analytics_attempts SET status='published',published_at=now(),last_activity=now(),
+                        completed_steps=array_append(completed_steps,'preview') WHERE id=$1""", attempt_id)
+                await conn.execute("""INSERT INTO analytics_users(user_id,first_published_at) VALUES($1,now())
+                    ON CONFLICT(user_id) DO UPDATE SET first_published_at=coalesce(analytics_users.first_published_at,now())""", user_id)
+                await event(conn, 'profile_published', user_id, {'attempt_id': str(attempt_id) if attempt_id else None}, f'publish:{user_id}:{version}')
                 await conn.execute('DELETE FROM drafts WHERE user_id=$1', user_id)
                 return True
 
     async def visibility(self, user_id, active):
-        await self.pool.execute('UPDATE profiles SET active=$2,updated_at=now() WHERE user_id=$1', user_id, active)
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                changed = await conn.fetchval('UPDATE profiles SET active=$2,updated_at=now() WHERE user_id=$1 AND active IS DISTINCT FROM $2 RETURNING true', user_id, active)
+                if changed:
+                    await event(conn, 'profile_shown' if active else 'profile_hidden', user_id)
+                return bool(changed)
 
     async def delete(self, user_id):
         async with self.pool.acquire() as conn:
@@ -152,6 +197,12 @@ class Database:
                         user_id, profile, draft)
                 await conn.execute('DELETE FROM drafts WHERE user_id=$1', user_id)
                 await conn.execute('DELETE FROM profiles WHERE user_id=$1', user_id)
+                if archive_id:
+                    if draft:
+                        attempt_id = json.loads(draft).get('attempt_id')
+                        if attempt_id:
+                            await conn.execute("UPDATE analytics_attempts SET status='deleted',last_activity=now() WHERE id=$1::uuid", UUID(attempt_id))
+                    await event(conn, 'profile_deleted' if profile else 'draft_deleted', user_id, {'archive_id': archive_id}, f'delete:{archive_id}')
                 return archive_id
 
     async def list_profiles(self, query='', page=1, status='all'):
@@ -207,6 +258,7 @@ class Database:
                 if changed:
                     await conn.execute("""INSERT INTO moderation_events(user_id,action,reason,moderator)
                         VALUES($1,$2,$3,$4)""", user_id, 'block' if blocked else 'unblock', reason, moderator)
+                    await event(conn, 'moderation_block' if blocked else 'moderation_unblock', user_id)
                 return bool(changed)
 
     async def moderation_history(self, user_id):
@@ -243,6 +295,10 @@ class Database:
                     VALUES($1,$2,$3) ON CONFLICT(actor,target) DO NOTHING RETURNING true''', actor, target, liked)
                 mutual = liked and bool(await conn.fetchval(
                     'SELECT liked FROM reactions WHERE actor=$1 AND target=$2', target, actor))
+                if result:
+                    await event(conn, 'profile_liked' if liked else 'profile_skipped', actor, {'target_id': target})
+                    if mutual:
+                        await event(conn, 'match_created', actor, {'target_id': target})
                 return bool(result), bool(result and mutual)
 
     async def matches(self, user_id):

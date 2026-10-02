@@ -14,5 +14,9 @@ class ProxySession(AiohttpSession):
         return session
 
 
-def create_bot(settings):
-    return Bot(settings.bot_token, session=ProxySession(settings.api_base, settings.proxy_secret))
+def create_bot(settings, db=None, channel="bot"):
+    session = ProxySession(settings.api_base, settings.proxy_secret)
+    if db is not None:
+        from app.analytics import TelegramMetricsMiddleware
+        session.middleware(TelegramMetricsMiddleware(db, channel))
+    return Bot(settings.bot_token, session=session)
