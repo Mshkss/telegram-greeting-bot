@@ -36,7 +36,8 @@ async def prompt(message, draft):
             'Анкету видят другие участники и администратор. Контакт в Telegram открывается '
             'при взаимном лайке. Фото хранится в Telegram; мы сохраняем его идентификатор.\n\n'
             'Продолжая, вы подтверждаете совершеннолетие и соглашаетесь на хранение данных '
-            'и показ анкеты. /cancel — отменить, /delete — удалить данные анкеты.',
+            'и показ анкеты. После удаления копии анкеты и текущего черновика остаются '
+            'в закрытом архиве администратора. /cancel — отменить черновик, /delete — убрать анкету из бота.',
             reply_markup=keyboard([[('Мне есть 18, продолжить', cb('agree'))]]))
     elif step == 'gender':
         await message.answer('Ты парень или девушка?', reply_markup=keyboard([
@@ -70,11 +71,18 @@ async def show_profile(message, db, uid):
         await message.answer('Анкеты пока нет. Нажми «Заполнить / изменить».', reply_markup=menu())
         return
     await message.answer_photo(profile['photo_file_id'], caption=caption(profile))
-    await message.answer('Анкета видна в поиске.' if profile['active'] else 'Анкета скрыта.', reply_markup=menu())
+    if profile['blocked']:
+        await message.answer('Анкета заблокирована модератором. Причина: ' + profile['moderation_reason'], reply_markup=menu())
+    else:
+        await message.answer('Анкета видна в поиске.' if profile['active'] else 'Анкета скрыта.', reply_markup=menu())
 
 
 async def browse(message, db, uid):
     profile = await db.profile(uid)
+    state = await db.moderation(uid)
+    if state['blocked']:
+        await message.answer('Доступ к поиску ограничен модератором. Причина: ' + state['reason'], reply_markup=menu())
+        return
     if not profile or not profile['active']:
         await message.answer('Сначала заполни и включи показ своей анкеты.', reply_markup=menu())
         return
@@ -95,6 +103,10 @@ def contact_keyboard(profile):
 
 
 async def show_matches(message, db, uid):
+    state = await db.moderation(uid)
+    if state['blocked']:
+        await message.answer('Совпадения недоступны: ' + state['reason'], reply_markup=menu())
+        return
     matches = await db.matches(uid)
     if not matches:
         await message.answer('Взаимных лайков пока нет.', reply_markup=menu())
@@ -114,6 +126,9 @@ def build_router(db):
         if name == 'profile':
             await show_profile(message, db, uid)
         elif name == 'edit':
+            state = await db.moderation(uid)
+            if state['blocked']:
+                await message.answer('Можно исправить анкету, но блокировку снимает администратор. Причина: ' + state['reason'])
             draft = await db.save_draft(uid, 'consent', {
                 'name': user.first_name[:64], 'username': user.username, 'goals': []})
             await prompt(message, draft)
@@ -126,9 +141,13 @@ def build_router(db):
                 await message.answer('Сначала создай анкету.', reply_markup=menu())
                 return
             await db.visibility(uid, name == 'show')
-            await message.answer('Анкета скрыта.' if name == 'hide' else 'Анкета снова видна.', reply_markup=menu())
+            state = await db.moderation(uid)
+            text = 'Анкета скрыта.' if name == 'hide' else 'Анкета снова видна.'
+            if state['blocked']:
+                text = 'Блокировка модератора действует. Анкета не видна в поиске. Причина: ' + state['reason']
+            await message.answer(text, reply_markup=menu())
         elif name == 'delete':
-            await message.answer('Удалить анкету, черновик и лайки? Это действие нельзя отменить.',
+            await message.answer('Убрать анкету из бота и удалить лайки? Копии анкеты и текущего черновика останутся в закрытом архиве администратора. Они не будут видны другим участникам.',
                 reply_markup=keyboard([[('Да, удалить', 'delete:confirm'), ('Отмена', 'menu:profile')]]))
 
     @router.message(CommandStart())
@@ -161,7 +180,7 @@ def build_router(db):
         await callback.answer()
         await db.delete(callback.from_user.id)
         await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.answer('Анкета, черновик и лайки удалены. /start — начать заново.')
+        await callback.message.answer('Анкета убрана из бота, лайки удалены. Копия сохранена в закрытом архиве администратора. /start — начать заново.')
 
     @router.callback_query(F.data.startswith('draft:'))
     async def draft_click(callback: CallbackQuery):
@@ -202,7 +221,10 @@ def build_router(db):
             saved = await db.publish(uid, version)
             await callback.answer('Сохранено!' if saved else 'Анкета уже обработана.')
             await callback.message.edit_reply_markup(reply_markup=None)
-            await callback.message.answer('Анкета сохранена и доступна в поиске.', reply_markup=menu())
+            state = await db.moderation(uid)
+            text = ('Анкета сохранена, но остаётся заблокированной. Причина: ' + state['reason']
+                    if state['blocked'] else 'Анкета сохранена и доступна в поиске.')
+            await callback.message.answer(text, reply_markup=menu())
             return
         if next_step:
             draft = await db.save_draft(uid, next_step, data)
