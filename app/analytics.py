@@ -113,7 +113,7 @@ class AnalyticsStore:
         async with self.pool.acquire() as conn:
             await event(conn, name, user_id, properties, dedupe_key)
 
-    async def begin_update(self, update_id, user_id, action, source=None, at=None):
+    async def begin_update(self, update_id, user_id, action, source=None, at=None, *, display_name=None, username=None):
         at = at or utcnow()
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -124,6 +124,10 @@ class AnalyticsStore:
                     return None
                 await conn.execute('INSERT INTO analytics_users(user_id) VALUES($1) ON CONFLICT DO NOTHING', user_id)
                 user = await conn.fetchrow('SELECT * FROM analytics_users WHERE user_id=$1 FOR UPDATE', user_id)
+                if display_name is not None:
+                    # A removed username must clear the stored value too.
+                    await conn.execute('UPDATE analytics_users SET display_name=$2,username=$3 WHERE user_id=$1',
+                        user_id, display_name, username)
                 session = user['current_session']
                 if not user['last_seen'] or at >= user['last_seen'] + timedelta(minutes=30):
                     session = await conn.fetchval("""INSERT INTO analytics_sessions(user_id,started_at,last_activity)
@@ -176,7 +180,8 @@ class ActivityMiddleware(BaseMiddleware):
             return await handler(update, data)
         started = time.perf_counter()
         context = await self.db.begin_update(update.update_id, user.id, action_code(incoming),
-            start_source(incoming.text) if update.message else None)
+            start_source(incoming.text) if update.message else None,
+            display_name=user.full_name, username=user.username)
         if context is None:
             return None  # Telegram redelivery: never repeat a side effect.
         token = CONTEXT.set(context)

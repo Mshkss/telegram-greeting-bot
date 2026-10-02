@@ -277,7 +277,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 3)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 4)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -468,3 +468,64 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.send('/edit')
             self.assertIsNotNone(await self.db.draft(42))
             self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='settings_changed'"),1)
+
+
+    async def test_users_identity_source_and_authenticated_listing(self):
+        from app.analytics import ActivityMiddleware
+        self.dp.update.outer_middleware(ActivityMiddleware(self.db))
+        await self.send('/start itmo_chat')
+        user = await self.db.pool.fetchrow('SELECT * FROM analytics_users WHERE user_id=42')
+        self.assertEqual((user['display_name'],user['username'],user['first_source']),('Test','example','itmo_chat'))
+        self.assertIsNone(await self.db.profile(42))
+        auth = {'Authorization': 'Basic ' + base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            self.assertEqual((await client.get('/users')).status,401)
+            response = await client.get('/users?q=@example',headers=auth)
+            self.assertEqual(response.status,200)
+            body = await response.text()
+            for value in ('Найдено пользователей: 1','<code>42</code>','@example','itmo_chat','Черновик'):
+                self.assertIn(value,body)
+            await self.db.delete(42)
+            await self.db.begin_update(100,42,'start','poster_october',display_name='<script>New</script>',username=None)
+            response = await client.get('/users?q=42',headers=auth)
+            body = await response.text()
+            self.assertIn('Найдено пользователей: 1',body)
+            self.assertIn('&lt;script&gt;New&lt;/script&gt;',body)
+            self.assertNotIn('<script>',body)
+            self.assertNotIn('@example',body)
+            self.assertIn('itmo_chat',body)
+            self.assertIn('poster_october',body)
+            self.assertIn('/archive?q=42',body)
+            for path in ('/users?page=-1','/users?page=abc','/users?scope=oops','/users?from=wrong'):
+                self.assertEqual((await client.get(path,headers=auth)).status,400)
+            body = await (await client.get('/settings',headers=auth)).text()
+            self.assertIn('https://t.me/ITMO_connectbot?start=itmo_chat',body)
+
+    async def test_users_activity_filter_and_pagination(self):
+        from datetime import datetime, date, timezone
+        from app.reports import users_report
+        await self.db.pool.execute("INSERT INTO analytics_users(user_id,display_name) SELECT n,'Legacy' FROM generate_series(1,31) n")
+        await self.db.begin_update(101,32,'message',at=datetime(2026,1,1,21,1,tzinfo=timezone.utc),display_name='Live',username='alice')
+        first = await users_report(self.db)
+        second = await users_report(self.db,page=2)
+        self.assertEqual((first['total'],first['pages'],len(first['rows']),len(second['rows'])),(32,2,30,2))
+        self.assertFalse({r['user_id'] for r in first['rows']} & {r['user_id'] for r in second['rows']})
+        self.assertEqual(first['rows'][0]['user_id'],32)
+        active = await users_report(self.db,start=date(2026,1,2),end=date(2026,1,2))
+        self.assertEqual(active['total'],1)
+        self.assertEqual(active['rows'][0]['user_id'],32)
+        self.assertEqual((await users_report(self.db,start=date(2026,1,1),end=date(2026,1,1)))['total'],0)
+        self.assertEqual((await users_report(self.db,query='@ALICE'))['total'],1)
+        self.assertEqual((await users_report(self.db,query="%' OR true --"))['total'],0)
+
+    async def test_users_migration_backfills_existing_data(self):
+        await self.publish(42,name='Current')
+        await self.publish(43,name='Deleted')
+        await self.db.delete(43)
+        await self.db.save_draft(44,'age',{'name':'Draft','username':'draft_user'})
+        await self.db.pool.execute('INSERT INTO analytics_users(user_id) VALUES(44) ON CONFLICT DO NOTHING')
+        await self.db.pool.execute("DELETE FROM schema_migrations WHERE version=4; ALTER TABLE analytics_users DROP COLUMN display_name,DROP COLUMN username; DROP INDEX analytics_users_last_seen_idx")
+        await asyncio.gather(self.db.initialize(),self.db.initialize())
+        rows = await self.db.pool.fetch('SELECT user_id,display_name,username FROM analytics_users ORDER BY user_id')
+        self.assertEqual([r['display_name'] for r in rows],['Current','Deleted','Draft'])
+        self.assertEqual(rows[2]['username'],'draft_user')

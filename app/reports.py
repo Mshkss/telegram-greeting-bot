@@ -125,3 +125,24 @@ async def dashboard_report(db, start, end, now=None):
                 count(*) FILTER(WHERE active AND NOT EXISTS(SELECT 1 FROM user_moderation m WHERE m.user_id=p.user_id AND blocked)) AS searchable
                 FROM profiles p""")
     return report
+
+
+async def users_report(db, query='', page=1, start=None, end=None):
+    """All known users, optionally limited to observed activity on Moscow dates."""
+    query = query.removeprefix('@')
+    where = """WHERE ($1='' OR strpos(lower(concat_ws(' ',u.user_id::text,u.display_name,u.username)),lower($1))>0)
+        AND ($2::date IS NULL OR EXISTS (SELECT 1 FROM analytics_activity_days a
+            WHERE a.user_id=u.user_id AND a.day BETWEEN $2 AND $3))"""
+    async with db.pool.acquire() as c:
+        async with c.transaction(isolation='repeatable_read', readonly=True):
+            total = await c.fetchval('SELECT count(*) FROM analytics_users u '+where, query,start,end)
+            pages = max(1,(total+29)//30)
+            page = min(max(1,page),pages)
+            rows = await c.fetch("""SELECT u.*,p.active,coalesce(m.blocked,false) AS blocked,
+                EXISTS(SELECT 1 FROM drafts d WHERE d.user_id=u.user_id) AS has_draft,
+                EXISTS(SELECT 1 FROM profile_archives a WHERE a.user_id=u.user_id) AS has_archive
+                FROM analytics_users u LEFT JOIN profiles p USING(user_id)
+                LEFT JOIN user_moderation m USING(user_id) """+where+"""
+                ORDER BY u.last_seen DESC NULLS LAST,u.user_id DESC LIMIT 30 OFFSET $4""",
+                query,start,end,(page-1)*30)
+    return {'total':total,'rows':rows,'page':page,'pages':pages}

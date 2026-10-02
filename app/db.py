@@ -69,6 +69,21 @@ CREATE INDEX moderation_events_user_idx ON moderation_events(user_id, id DESC);
 """)]
 
 MIGRATIONS.append((3, ANALYTICS_SCHEMA))
+MIGRATIONS.append((4, """
+ALTER TABLE analytics_users ADD COLUMN display_name TEXT;
+ALTER TABLE analytics_users ADD COLUMN username TEXT;
+UPDATE analytics_users u SET display_name=old.name,username=old.username
+FROM (
+    SELECT a.user_id,coalesce(p.name,d.data->>'name',
+        h.profile_snapshot->>'name',h.draft_snapshot->'data'->>'name') AS name,
+        coalesce(p.username,d.data->>'username',
+        h.profile_snapshot->>'username',h.draft_snapshot->'data'->>'username') AS username
+    FROM analytics_users a LEFT JOIN profiles p USING(user_id) LEFT JOIN drafts d USING(user_id)
+    LEFT JOIN LATERAL (SELECT profile_snapshot,draft_snapshot FROM profile_archives
+        WHERE user_id=a.user_id ORDER BY deleted_at DESC,id DESC LIMIT 1) h ON true
+) old WHERE old.user_id=u.user_id;
+CREATE INDEX analytics_users_last_seen_idx ON analytics_users(last_seen DESC NULLS LAST,user_id DESC);
+"""))
 
 PROFILE_SELECT = """SELECT p.*, coalesce(m.blocked,false) AS blocked,
     coalesce(m.reason,'') AS moderation_reason FROM profiles p

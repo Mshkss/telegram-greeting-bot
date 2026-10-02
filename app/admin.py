@@ -50,7 +50,7 @@ def page(title, content):
     return web.Response(text=f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Знакомства</title>
 <style>{STYLE}</style></head><body><main><header><a href="/">💘 Знакомства / Админка</a>
-<nav><a href="/dashboard">Дашборд</a><a href="/profiles">Анкеты</a><a href="/settings">Настройки</a></nav></header>{content}</main></body></html>''', content_type='text/html')
+<nav><a href="/dashboard">Дашборд</a><a href="/profiles">Анкеты</a><a href="/users">Пользователи</a><a href="/settings">Настройки</a></nav></header>{content}</main></body></html>''', content_type='text/html')
 
 
 def auth_middleware(username, password):
