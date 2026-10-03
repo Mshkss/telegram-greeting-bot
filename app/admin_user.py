@@ -1,4 +1,5 @@
 """Private, read-only view of a single user's recorded journey."""
+from app.admin_urls import base_path, admin_url
 import json
 from urllib.parse import urlencode
 
@@ -31,7 +32,7 @@ def stamp(value):
 def user_link(value):
     # Only numeric Telegram IDs become URLs; all other values remain escaped text.
     if isinstance(value,int) and not isinstance(value,bool) and 0 < value <= 2**63-1:
-        return f'<a href="/users/{value}"><code>{value}</code></a>'
+        return f'<a href="{base_path()}/users/{value}"><code>{value}</code></a>'
     return esc(value) if value is not None else '—'
 
 
@@ -57,7 +58,7 @@ def event_row(row, uid):
             details.append('Продолжение старого черновика')
     archive = props.get('archive_id')
     if name in ('profile_deleted','draft_deleted') and isinstance(archive,int):
-        details.append(f'<a href="/archive/{archive}">Архив #{archive}</a>')
+        details.append(f'<a href="{base_path()}/archive/{archive}">Архив #{archive}</a>')
     if props.get('attempt_id'):
         details.append('Попытка: <code>'+esc(props['attempt_id'])+'</code>')
     # A match initiated by someone else must not look like this user's own session.
@@ -93,18 +94,18 @@ def history_html(report):
         data = report[key]
         def link(number,label):
             url = urlencode({**params,key+'_page':number})
-            return f'<a href="/users/{uid}?{esc(url)}#{key}">{label}</a>'
+            return f'<a href="{base_path()}/users/{uid}?{esc(url)}#{key}">{label}</a>'
         parts = [f"Всего: {data['total']} · Страница {data['page']} из {data['pages']}"]
         if data['page']>1:
             parts.insert(0,link(data['page']-1,'← Назад'))
         if data['page']<data['pages']:
             parts.append(link(data['page']+1,'Далее →'))
         return '<p>'+' · '.join(parts)+'</p>'
-    links = ['<a href="/users">← Пользователи</a>']
+    links = [f'<a href="{base_path()}/users">← Пользователи</a>']
     if user['active'] is not None:
-        links.append(f'<a href="/profiles/{uid}">Текущая анкета</a>')
+        links.append(f'<a href="{base_path()}/profiles/{uid}">Текущая анкета</a>')
     if user['has_archive']:
-        links.append(f'<a href="/archive?q={uid}">Архив анкет</a>')
+        links.append(f'<a href="{base_path()}/archive?q={uid}">Архив анкет</a>')
     counts = {r['name']:r['total'] for r in report['counts']}
     metrics = ''.join([card('Входящие действия',report['updates']['total']),
         card('Просмотры карточек',counts.get('profile_viewed',0)),card('Лайки',counts.get('profile_liked',0)),
@@ -132,7 +133,7 @@ def history_html(report):
 <p class="muted">{'Известен до установки аналитики.' if user['known_before_tracking'] else ''}
 Сбор событий с {stamp(report['tracking_since'])} МСК. Имя и username — последние известные боту.</p></section>
 <form method="get"><label>С <input type="date" name="from" value="{start or ''}" required></label>
-<label>По <input type="date" name="to" value="{end or ''}" required></label><button>Показать период</button><a href="/users/{uid}">Вся история</a></form>
+<label>По <input type="date" name="to" value="{end or ''}" required></label><button>Показать период</button><a href="{base_path()}/users/{uid}">Вся история</a></form>
 <h2>{esc(period)}</h2><p class="muted">Время по Москве. Тексты сообщений и фотографии в ленте не сохраняются.</p>
 <nav><a href="#attempts">Попытки заполнения</a><a href="#events">Лента действий</a><a href="#sessions">Сессии</a><a href="#errors">Ошибки</a></nav>
 <div class="metrics">{metrics}</div>

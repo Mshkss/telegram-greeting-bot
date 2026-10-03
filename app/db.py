@@ -95,6 +95,22 @@ CREATE INDEX analytics_events_failed_recipient_idx ON analytics_events((properti
     WHERE name='telegram_call' AND properties->>'ok'='false';
 """))
 
+MIGRATIONS.append((6, """
+CREATE TABLE admin_access_events (
+    id BIGSERIAL PRIMARY KEY,
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    outcome TEXT NOT NULL CHECK(outcome IN ('success','denied','challenge','throttled')),
+    username TEXT,
+    client_ip TEXT NOT NULL,
+    peer_ip TEXT NOT NULL,
+    forwarded BOOLEAN NOT NULL,
+    user_agent TEXT NOT NULL,
+    method TEXT NOT NULL,
+    route TEXT NOT NULL
+);
+CREATE INDEX admin_access_events_time_idx ON admin_access_events(id DESC);
+"""))
+
 PROFILE_SELECT = """SELECT p.*, coalesce(m.blocked,false) AS blocked,
     coalesce(m.reason,'') AS moderation_reason FROM profiles p
     LEFT JOIN user_moderation m ON m.user_id=p.user_id """

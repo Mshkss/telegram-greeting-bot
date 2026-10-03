@@ -18,6 +18,8 @@ class Settings:
     db_password: str
     admin_user: str
     admin_password: str
+    admin_base_path: str = "/admin"
+    admin_trusted_proxies: str = "127.0.0.1/32,::1/128"
 
     @classmethod
     def load(cls):
@@ -38,4 +40,6 @@ class Settings:
         return cls(required('BOT_TOKEN'), api_base, required('TELEGRAM_PROXY_SECRET'),
                    os.getenv('POSTGRES_HOST', 'localhost'), int(os.getenv('POSTGRES_PORT', '5432')),
                    os.getenv('POSTGRES_DB', 'dating'), os.getenv('POSTGRES_USER', 'dating'),
-                   required('POSTGRES_PASSWORD'), os.getenv('ADMIN_USER', 'admin'), password)
+                   required('POSTGRES_PASSWORD'), os.getenv('ADMIN_USER', 'admin'), password,
+                   os.getenv('ADMIN_BASE_PATH', '/admin'),
+                   os.getenv('ADMIN_TRUSTED_PROXIES', '127.0.0.1/32,::1/128'))

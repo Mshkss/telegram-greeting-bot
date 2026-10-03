@@ -1,7 +1,6 @@
 """Password-protected, moderation administration UI. Photos never go to disk."""
+from app.admin_urls import base_path, admin_url
 import asyncio
-import base64
-import binascii
 import os
 import hashlib
 import hmac
@@ -10,13 +9,14 @@ import io
 import math
 import time
 import secrets
-from collections import OrderedDict
 from urllib.parse import urlencode
 
 from aiohttp import ClientError, web
 from aiogram.exceptions import TelegramAPIError
 
 from app.config import Settings
+from app.admin_urls import normalize_base_path, prefix_middleware
+from app.admin_auth import auth_middleware, register_access_log
 from app.db import Database
 from app.domain import GOALS, GENDERS
 from app.telegram import create_bot
@@ -49,52 +49,10 @@ button{background:#b6bcff;color:#11142b;cursor:pointer}table{border-collapse:col
 def page(title, content):
     return web.Response(text=f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Знакомства</title>
-<style>{STYLE}</style></head><body><main><header><a href="/">💘 Знакомства / Админка</a>
-<nav><a href="/dashboard">Дашборд</a><a href="/profiles">Анкеты</a><a href="/users">Пользователи</a><a href="/settings">Настройки</a></nav></header>{content}</main></body></html>''', content_type='text/html')
+<style>{STYLE}</style></head><body><main><header><a href="{base_path()}/">💘 Знакомства / Админка</a>
+<nav><a href="{base_path()}/dashboard">Дашборд</a><a href="{base_path()}/profiles">Анкеты</a><a href="{base_path()}/users">Пользователи</a><a href="{base_path()}/settings">Настройки</a><a href="{base_path()}/access-log">Журнал входов</a></nav></header>{content}</main></body></html>''', content_type='text/html')
 
 
-def auth_middleware(username, password):
-    expected = hashlib.sha256((username + ':' + password).encode()).digest()
-    failures = OrderedDict()
-
-    @web.middleware
-    async def middleware(request, handler):
-        peer, now = request.remote or 'unknown', time.monotonic()
-        count, started = failures.get(peer, (0, now))
-        if now - started >= 60:
-            count, started = 0, now
-        if count >= 10:
-            response = web.Response(status=429, text='Слишком много попыток. Подождите минуту.', headers={'Retry-After': '60'})
-        else:
-            try:
-                scheme, encoded = request.headers.get('Authorization', '').split(' ', 1)
-                if scheme.lower() != 'basic':
-                    raise ValueError('Unsupported authorization')
-                credentials = base64.b64decode(encoded, validate=True).decode('utf-8')
-                supplied = hashlib.sha256(credentials.encode()).digest()
-                valid = hmac.compare_digest(supplied, expected)
-            except (ValueError, UnicodeError, binascii.Error):
-                valid = False
-            if not valid:
-                failures[peer] = (count + 1, started)
-                failures.move_to_end(peer)
-                while len(failures) > 1024:
-                    failures.popitem(last=False)
-                response = web.Response(status=401, text='Нужна авторизация администратора.',
-                    headers={'WWW-Authenticate': 'Basic realm="Dating admin", charset="UTF-8"'})
-            else:
-                failures.pop(peer, None)
-                try:
-                    response = await handler(request)
-                except web.HTTPException as error:
-                    response = web.Response(status=error.status, text=error.text, headers=error.headers)
-        response.headers.update({
-            'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
-            'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
-            'Content-Security-Policy': "default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'",
-        })
-        return response
-    return middleware
 
 
 async def index(request):
@@ -107,18 +65,18 @@ async def index(request):
     status = request.query.get('status', 'all')
     total, profiles = await db.list_profiles(query, number, status)
     drafts = await db.draft_count()
-    rows = ''.join(f'''<tr><td><a href="/profiles/{p['user_id']}">{esc(p['name'])}</a>
+    rows = ''.join(f'''<tr><td><a href="{base_path()}/profiles/{p['user_id']}">{esc(p['name'])}</a>
 <div class="muted">{p['user_id']}</div></td><td>{esc('@'+p['username'] if p['username'] else '—')}</td>
 <td>{p['age']}</td><td>{esc(GENDERS[p['gender']])}</td>
 <td><span class="badge">{profile_status(p)}</span></td>
 <td>{p['created_at'].strftime('%d.%m.%Y')}</td></tr>''' for p in profiles)
     nav = ''
     if number > 1:
-        nav += f'<a href="/profiles?{esc(urlencode(dict(q=query,status=status,page=number-1)))}">← Назад</a>'
+        nav += f'<a href="{base_path()}/profiles?{esc(urlencode(dict(q=query,status=status,page=number-1)))}">← Назад</a>'
     if number*30 < total:
-        nav += f'<a href="/profiles?{esc(urlencode(dict(q=query,status=status,page=number+1)))}">Далее →</a>'
+        nav += f'<a href="{base_path()}/profiles?{esc(urlencode(dict(q=query,status=status,page=number+1)))}">Далее →</a>'
     options = ''.join(f'<option value="{key}" {"selected" if key == status else ""}>{label}</option>' for key, label in [('all','Все анкеты'),('active','В поиске'),('hidden','Скрытые'),('blocked','Заблокированные')])
-    return page('Анкеты', f'''<nav><a href="/profiles">Текущие анкеты</a><a href="/archive">Архив удалённых</a></nav><h1>Анкеты участников</h1><div class="stats">
+    return page('Анкеты', f'''<nav><a href="{base_path()}/profiles">Текущие анкеты</a><a href="{base_path()}/archive">Архив удалённых</a></nav><h1>Анкеты участников</h1><div class="stats">
 <div><strong>{total}</strong><span class="muted">{'Найдено анкет' if query else 'Сохранённых анкет'}</span></div>
 <div><strong>{drafts}</strong><span class="muted">Незавершённых анкет</span></div></div>
 <form method="get"><input name="q" value="{esc(query)}" placeholder="Имя, username или Telegram ID" aria-label="Поиск">
@@ -145,10 +103,10 @@ async def detail(request):
     p = await get_profile(request)
     goals = ''.join(f'<li>{esc(GOALS[g])}</li>' for g in p['goals'])
     moderation = await moderation_panel(request, p['user_id'], f"/profiles/{p['user_id']}/moderation")
-    return page(p['name'], f'''<nav><a href="/profiles">← Все анкеты</a></nav><div class="card profile">
-<div><img src="/profiles/{p['user_id']}/photo" alt="Фото анкеты"></div><div>
+    return page(p['name'], f'''<nav><a href="{base_path()}/profiles">← Все анкеты</a></nav><div class="card profile">
+<div><img src="{base_path()}/profiles/{p['user_id']}/photo" alt="Фото анкеты"></div><div>
 <h1>{esc(p['name'])}, {p['age']}</h1><span class="badge">{profile_status(p)}</span>
-<p><a href="/users/{p['user_id']}">Действия и попытки пользователя →</a></p>
+<p><a href="{base_path()}/users/{p['user_id']}">Действия и попытки пользователя →</a></p>
 <dl><dt>Telegram ID</dt><dd>{p['user_id']}</dd><dt>Username</dt><dd>{esc('@'+p['username'] if p['username'] else 'Не задан')}</dd>
 <dt>Пол</dt><dd>{esc(GENDERS[p['gender']])}</dd>
 <dt>Создана, UTC</dt><dd>{p['created_at'].strftime('%d.%m.%Y %H:%M')}</dd>
@@ -224,7 +182,7 @@ async def moderation_panel(request, uid, action_url):
 <p class="description">{esc(state['reason'])}</p>
 <p class="muted">Блокировка исключает пользователя из поиска, лайков и совпадений.
 Удаление и новая регистрация её не снимают. Разблокировка не восстанавливает удалённую анкету.</p>
-<form class="moderation" method="post" action="{action_url}">
+<form class="moderation" method="post" action="{esc(admin_url(action_url))}">
 <input type="hidden" name="action" value="{action}">
 <input type="hidden" name="csrf" value="{csrf_token(request, uid, action)}">
 <label>Причина (видна пользователю при блокировке)
@@ -233,7 +191,7 @@ async def moderation_panel(request, uid, action_url):
 <h3>История действий · последние 50</h3><div class="scroll"><table class="history"><thead>
 <tr><th>Дата, UTC</th><th>Действие</th><th>Причина</th><th>Администратор</th></tr></thead>
 <tbody>{rows or '<tr><td colspan="4">Действий пока нет.</td></tr>'}</tbody></table></div>
-<a href="/archive?q={uid}">Все удаления этого пользователя →</a></section>'''
+<a href="{base_path()}/archive?q={uid}">Все удаления этого пользователя →</a></section>'''
 
 
 async def moderate(request):
@@ -258,7 +216,7 @@ async def moderate(request):
         raise web.HTTPBadRequest(text=str(error))
     except LookupError:
         raise web.HTTPNotFound(text='Участник не найден')
-    raise web.HTTPSeeOther(location=location)
+    raise web.HTTPSeeOther(location=admin_url(location))
 
 
 async def get_archive(request):
@@ -284,15 +242,15 @@ async def archive_index(request):
     rows = ''
     for record in archives:
         data = record['profile_snapshot'] or (record['draft_snapshot'] or {}).get('data', {})
-        rows += f'''<tr><td><a href="/archive/{record['id']}">#{record['id']} · {esc(data.get('name','Без имени'))}</a>
+        rows += f'''<tr><td><a href="{base_path()}/archive/{record['id']}">#{record['id']} · {esc(data.get('name','Без имени'))}</a>
 <div class="muted">{record['user_id']}</div></td><td>{esc(data.get('username','—'))}</td>
 <td>{'Анкета' if record['profile_snapshot'] else 'Черновик'}</td>
 <td>{record['deleted_at'].strftime('%d.%m.%Y %H:%M')}</td></tr>'''
     nav = ''
     if number > 1:
-        nav += f'<a href="/archive?{esc(urlencode(dict(q=query,page=number-1)))}">← Назад</a>'
+        nav += f'<a href="{base_path()}/archive?{esc(urlencode(dict(q=query,page=number-1)))}">← Назад</a>'
     if number*30 < total:
-        nav += f'<a href="/archive?{esc(urlencode(dict(q=query,page=number+1)))}">Далее →</a>'
+        nav += f'<a href="{base_path()}/archive?{esc(urlencode(dict(q=query,page=number+1)))}">Далее →</a>'
     return page('Архив удалённых', f'''<h1>Архив удалённых анкет</h1>
 <p class="muted">Каждое удаление — отдельная запись. В поиске бота эти анкеты не показываются.</p>
 <form method="get"><input name="q" value="{esc(query)}" placeholder="Имя, username или Telegram ID" aria-label="Поиск"><button>Найти</button></form>
@@ -302,7 +260,7 @@ async def archive_index(request):
 
 
 def archive_snapshot(data, photo_url, title):
-    photo_html = f'<img src="{photo_url}" alt="Фото удалённой анкеты">' if data.get('photo_file_id') else '<p>Фото не загружено</p>'
+    photo_html = f'<img src="{esc(admin_url(photo_url))}" alt="Фото удалённой анкеты">' if data.get('photo_file_id') else '<p>Фото не загружено</p>'
     goals = ''.join(f'<li>{esc(GOALS.get(goal,goal))}</li>' for goal in data.get('goals', []))
     return f'''<section class="card"><h2>{title}</h2><div class="profile"><div>{photo_html}</div><div>
 <h2>{esc(data.get('name','Без имени'))}, {esc(data.get('age','Возраст не указан'))}</h2>
@@ -316,20 +274,23 @@ async def archive_detail(request):
     record = await get_archive(request)
     aid, uid = record['id'], record['user_id']
     content = f"<h1>Удалённая анкета #{aid}</h1><p>Telegram ID: {uid} · Удалена {record['deleted_at'].strftime('%d.%m.%Y %H:%M')} UTC</p>"
-    content += f'<p><a href="/users/{uid}">Действия и попытки пользователя →</a></p>'
+    content += f'<p><a href="{base_path()}/users/{uid}">Действия и попытки пользователя →</a></p>'
     if record['profile_snapshot']:
         content += archive_snapshot(record['profile_snapshot'], f'/archive/{aid}/photo', 'Сохранённая анкета на момент удаления')
     if record['draft_snapshot']:
         draft = record['draft_snapshot']
         content += archive_snapshot(draft['data'], f'/archive/{aid}/photo?part=draft', f"Черновик · шаг {esc(draft['step'])}")
     if await request.app[DB].profile(uid):
-        content += f'<p><a href="/profiles/{uid}">Текущая анкета пользователя →</a></p>'
+        content += f'<p><a href="{base_path()}/profiles/{uid}">Текущая анкета пользователя →</a></p>'
     content += await moderation_panel(request, uid, f'/archive/{aid}/moderation')
     return page('Удалённая анкета', content)
 
 
 def create_app(settings, db=None, bot=None):
-    app = web.Application(middlewares=[auth_middleware(settings.admin_user, settings.admin_password)], client_max_size=16384)
+    prefix = normalize_base_path(getattr(settings, 'admin_base_path', ''))
+    app = web.Application(middlewares=[prefix_middleware(prefix),
+        auth_middleware(settings.admin_user, settings.admin_password, DB,
+            getattr(settings, 'admin_trusted_proxies', '127.0.0.1/32,::1/128'))], client_max_size=16384)
 
     async def resources(app):
         database = db or await Database.connect(settings)
@@ -352,8 +313,19 @@ def create_app(settings, db=None, bot=None):
         web.get('/archive/{aid}/photo', photo), web.post('/archive/{aid}/moderation', moderate)])
     from app.admin_metrics import register_metrics
     register_metrics(app, DB, ADMIN_USER, page, csrf_token, check_csrf)
+    register_access_log(app, DB, page)
+    if prefix:
+        # Both proxy_pass forms work: preserve /admin/... or strip it to /... .
+        # All generated browser URLs always use the configured public prefix.
+        for route in list(app.router.routes()):
+            app.router.add_route(route.method, prefix+route.resource.canonical, route.handler)
+        async def trailing_slash(request):
+            raise web.HTTPPermanentRedirect(location=prefix+'/')
+        app.router.add_get(prefix, trailing_slash)
     return app
 
 
 if __name__ == '__main__':
+    import logging
+    logging.basicConfig(level=logging.INFO, format='%(message)s')
     web.run_app(create_app(Settings.load()), host=os.getenv('ADMIN_HOST', '127.0.0.1'), port=8080, access_log=None)

@@ -1,3 +1,4 @@
+from app.admin_urls import base_path, admin_url
 import csv
 import html
 import io
@@ -88,11 +89,11 @@ def dashboard_html(r):
     controls = f'<form method="get"><label>С <input type="date" name="from" value="{r["start"]}" required></label><label>По <input type="date" name="to" value="{r["end"]}" max="{r["today"]}" required></label><button>Показать</button></form>'
     return f'''<h1>Дашборд</h1><p class="muted">Дни по Москве · сбор с {tracking} МСК · даты включительно</p>
 {controls}{empty_note}<div class="metrics">{kpis}</div>
-<p><a href="/users?scope=active&amp;from={r['start']}&amp;to={r['end']}">Активные пользователи за период →</a> · <a href="/users">Все пользователи и Telegram ID →</a></p>
+<p><a href="{base_path()}/users?scope=active&amp;from={r['start']}&amp;to={r['end']}">Активные пользователи за период →</a> · <a href="{base_path()}/users">Все пользователи и Telegram ID →</a></p>
 <section class="card"><h2>Активность по дням</h2><div class="bars" role="img" aria-label="Активные пользователи по дням, точные значения в таблице ниже">{bars}</div>
 <p class="muted">{r['start']} → {r['end']}. Открытие чата и чтение сообщений без действия не наблюдаются.</p>
 <details><summary>Точные значения и новые пользователи</summary>{table(['Дата','Активные','Новые'],day_rows)}</details>
-<a href="/analytics/daily.csv?from={r['start']}&to={r['end']}">Скачать CSV по дням</a></section>
+<a href="{base_path()}/analytics/daily.csv?from={r['start']}&to={r['end']}">Скачать CSV по дням</a></section>
 <section class="card"><h2>Привлечение</h2><div class="metrics">
 {card('Первый наблюдаемый /start',first,'Включая ранее известных пользователей')}
 {card('Повторные /start',repeat,'От второго отслеженного запуска')}
@@ -172,20 +173,20 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
                 state.append('Заблокирован')
             if user['active'] is not None:
                 label = 'В поиске' if user['active'] and not user['blocked'] else 'Скрыта'
-                state.append(f'<a href="/profiles/{uid}">{label}</a>')
+                state.append(f'<a href="{base_path()}/profiles/{uid}">{label}</a>')
             elif user['has_draft']:
                 state.append('Черновик')
             else:
                 state.append('Нет анкеты')
             if user['has_archive']:
-                state.append(f'<a href="/archive?q={uid}">Архив</a>')
-            rows.append((f'<a href="/users/{uid}"><code>{uid}</code></a>',esc(user['display_name'] or '—'),
+                state.append(f'<a href="{base_path()}/archive?q={uid}">Архив</a>')
+            rows.append((f'<a href="{base_path()}/users/{uid}"><code>{uid}</code></a>',esc(user['display_name'] or '—'),
                 esc('@'+user['username']) if user['username'] else '—',
                 esc(user['first_source'] or 'unknown'),esc(user['last_source'] or 'unknown'),
                 stamp(user['first_seen']),stamp(user['last_seen']),user['start_count'],' · '.join(state)))
         params = {'q':query,'scope':scope,'from':str(start),'to':str(end)}
         def link(number,label):
-            return f'<a href="/users?{esc(urlencode({**params,"page":number}))}">{label}</a>'
+            return f'<a href="{base_path()}/users?{esc(urlencode({**params,"page":number}))}">{label}</a>'
         pagination = f'Страница {report["page"]} из {report["pages"]}'
         if report['page']>1:
             pagination = link(report['page']-1,'← Назад')+' · '+pagination
@@ -194,7 +195,7 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
         options = ''.join(f'<option value="{value}" {"selected" if value==scope else ""}>{label}</option>'
             for value,label in [('all','Все известные пользователи'),('active','Активные за период')])
         return page('Пользователи', f'''<h1>Пользователи</h1>
-<p><a href="/dashboard?from={start}&amp;to={end}">← Дашборд</a></p>
+<p><a href="{base_path()}/dashboard?from={start}&amp;to={end}">← Дашборд</a></p>
 <form method="get"><label>Поиск <input name="q" value="{esc(query)}" maxlength="128" placeholder="Telegram ID, имя, username"></label>
 <label>Показать <select name="scope">{options}</select></label>
 <label>С <input type="date" name="from" value="{start}" required></label>
@@ -245,7 +246,7 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
         if not check_csrf(request,0,'settings',form.get('csrf','')):
             raise web.HTTPForbidden(text='Обновите страницу настроек и повторите.')
         await request.app[db_key].update_settings(form.get('registrations_open')=='yes', request.app[user_key])
-        raise web.HTTPSeeOther(location='/settings')
+        raise web.HTTPSeeOther(location=admin_url('/settings'))
 
     app.add_routes([web.get('/',dashboard),web.get('/dashboard',dashboard),web.get('/analytics/daily.csv',daily_csv),
                     web.get('/users',users),web.get('/settings',settings_page),web.post('/settings',save_settings)])

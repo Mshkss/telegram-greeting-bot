@@ -53,7 +53,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             admin_user='admin', admin_password='correct-long-password')
         self.db = await Database.connect(self.settings)
         await self.db.initialize()
-        await self.db.pool.execute('TRUNCATE profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts CASCADE')
+        await self.db.pool.execute('TRUNCATE profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,admin_access_events CASCADE')
         await self.db.pool.execute('UPDATE app_settings SET registrations_open=true')
         self.session = ProxySession('https://proxy.example', 'test-secret')
         self.session.make_request = AsyncMock(return_value=True)
@@ -273,11 +273,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_database_migration_is_idempotent_and_concurrent(self):
         await self.publish(42)
         # Simulate the previous production schema, retaining the actual profile.
-        await self.db.pool.execute('DROP TABLE profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
+        await self.db.pool.execute('DROP TABLE admin_access_events,profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 5)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 6)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -635,3 +635,99 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         empty = await user_history_report(self.db,44)
         self.assertEqual(empty['events']['total'],0)
         self.assertEqual(empty['updates']['total'],0)
+
+    async def test_admin_prefix_links_forms_photos_and_redirects(self):
+        import re
+        self.settings.admin_base_path='/admin'
+        await self.publish(42)
+        await self.publish(43)
+        aid=await self.db.delete(43)
+        fake_bot=SimpleNamespace(get_file=AsyncMock(return_value=SimpleNamespace(file_path='photo.jpg',file_size=10)))
+        async def download(path,destination):
+            destination.write(b'\xff\xd8\xfftest')
+        fake_bot.download_file=AsyncMock(side_effect=download)
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,fake_bot))) as client:
+            # A stripping proxy sends root paths upstream; a preserving proxy keeps /admin.
+            for prefix in ('','/admin'):
+                for path in ('/','/profiles','/profiles/42','/users','/users/42','/archive',f'/archive/{aid}','/settings','/access-log'):
+                    response=await client.get(prefix+path,headers=auth)
+                    self.assertEqual(response.status,200,(prefix,path))
+                    body=await response.text()
+                    for attr,url in re.findall(r'(href|src|action)="([^"]+)"',body):
+                        if url.startswith('/'):
+                            self.assertTrue(url.startswith('/admin/'),(path,attr,url))
+                    self.assertNotIn('{base_path()}',body)
+                for path in ('/profiles/42/photo',f'/archive/{aid}/photo'):
+                    response=await client.get(prefix+path,headers=auth)
+                    self.assertEqual(response.status,200)
+                    self.assertEqual(await response.read(),b'\xff\xd8\xfftest')
+                response=await client.get(prefix+'/analytics/daily.csv',headers=auth)
+                self.assertEqual(response.status,200)
+                body=await (await client.get(prefix+'/settings',headers=auth)).text()
+                token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+                response=await client.post(prefix+'/settings',headers=auth,data={'csrf':token},allow_redirects=False)
+                self.assertEqual(response.headers['Location'],'/admin/settings')
+                body=await (await client.get(prefix+'/profiles/42',headers=auth)).text()
+                token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+                action='unblock' if (await self.db.moderation(42))['blocked'] else 'block'
+                response=await client.post(prefix+'/profiles/42/moderation',headers=auth,
+                    data={'action':action,'reason':'Проверка','csrf':token},allow_redirects=False)
+                self.assertEqual(response.status,303)
+                self.assertEqual(response.headers['Location'],'/admin/profiles/42')
+            response=await client.get('/admin',headers=auth,allow_redirects=False)
+            self.assertEqual(response.headers['Location'],'/admin/')
+            self.assertEqual((await client.get('/admin/profiles')).status,401)
+            self.assertEqual((await client.post('/admin/settings',headers=auth,data={})).status,403)
+
+    async def test_admin_access_log_redacts_credentials_and_deduplicates_visits(self):
+        from unittest.mock import patch
+        self.settings.admin_trusted_proxies='127.0.0.1/32'
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode(),
+            'X-Real-IP':'203.0.113.9','User-Agent':'<script>browser</script>'}
+        wrong={**auth,'Authorization':'Basic '+base64.b64encode(b'admin:SECRET_WRONG_PASSWORD').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            self.assertEqual((await client.get('/?token=SECRET_QUERY',headers=wrong)).status,401)
+            with patch('app.admin_auth.monotonic',return_value=10000):
+                responses=await asyncio.gather(*[client.get('/profiles',headers=auth) for _ in range(4)])
+                self.assertTrue(all(r.status==200 for r in responses))
+            with patch('app.admin_auth.monotonic',return_value=11800):
+                self.assertEqual((await client.get('/profiles',headers=auth)).status,200)
+            rows=await self.db.pool.fetch('SELECT * FROM admin_access_events ORDER BY id')
+            self.assertEqual([r['outcome'] for r in rows],['denied','success','success'])
+            self.assertTrue(all(r['client_ip']=='203.0.113.9' and r['forwarded'] for r in rows))
+            self.assertNotIn('SECRET',str(rows))
+            self.assertNotIn('correct-long-password',str(rows))
+            self.assertIsNone(rows[0]['username'])
+            response=await client.get('/access-log',headers=auth)
+            body=await response.text()
+            self.assertIn('&lt;script&gt;browser&lt;/script&gt;',body)
+            self.assertNotIn('<script>',body)
+            self.assertEqual((await client.get('/access-log?outcome=invalid',headers=auth)).status,400)
+            self.assertEqual((await client.get('/access-log?page=0',headers=auth)).status,400)
+            self.assertEqual((await client.get('/access-log')).status,401)
+        # Stored audit survives app restart; a restart begins a new observed visit.
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            body=await (await client.get('/access-log?outcome=denied',headers=auth)).text()
+            self.assertIn('Записей: 1',body)
+
+    async def test_admin_forwarded_ip_requires_trusted_proxy_and_throttle_isolated(self):
+        auth='Basic '+base64.b64encode(b'admin:correct-long-password').decode()
+        self.settings.admin_trusted_proxies='198.51.100.1/32'
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            await client.get('/',headers={'Authorization':auth,'X-Real-IP':'203.0.113.1','X-Forwarded-For':'192.0.2.1'})
+        row=await self.db.pool.fetchrow('SELECT * FROM admin_access_events ORDER BY id DESC LIMIT 1')
+        self.assertEqual(row['client_ip'],'127.0.0.1')
+        self.assertFalse(row['forwarded'])
+        self.settings.admin_trusted_proxies='127.0.0.1/32'
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            for _ in range(10):
+                self.assertEqual((await client.get('/',headers={'X-Real-IP':'203.0.113.10'})).status,401)
+            for _ in range(3):
+                self.assertEqual((await client.get('/',headers={'X-Real-IP':'203.0.113.10'})).status,429)
+            self.assertEqual((await client.get('/',headers={'X-Real-IP':'203.0.113.11','Authorization':auth})).status,200)
+            self.assertEqual((await client.get('/',headers={'X-Real-IP':'invalid, 203.0.113.11','Authorization':auth})).status,200)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM admin_access_events WHERE outcome='throttled'"),1)
+        row=await self.db.pool.fetchrow('SELECT * FROM admin_access_events ORDER BY id DESC LIMIT 1')
+        self.assertEqual(row['client_ip'],'127.0.0.1')
+        self.assertFalse(row['forwarded'])
