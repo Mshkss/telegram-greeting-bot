@@ -1041,7 +1041,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{eid}:yes')
         methods=[c.args[1] for c in self.session.make_request.call_args_list]
         sent=[m for m in methods if isinstance(m,SendMessage)]
-        self.assertEqual(len(sent),2);self.assertIn('ТЫ ЗАПИСАН',sent[0].text)
+        self.assertEqual(len(sent),2);self.assertIn('Ты записан',sent[0].text)
         self.assertIn('Хакатон',sent[0].text);self.assertEqual(sent[1].text,'Главное меню')
         self.assertEqual(sum(isinstance(m,EditMessageText) for m in methods),0)
         self.session.make_request.reset_mock();await self.send(callback='menu:registrations')
@@ -1091,11 +1091,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='event_registered'"),2)
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:no')
         sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
-        self.assertIn('ЗАПИСЬ ОБНОВЛЕНА',sent[0].text);self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('уже есть',sent[0].text)
+        self.assertIn('Запись обновлена',sent[0].text);self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('уже есть',sent[0].text)
         self.assertEqual(sent[-1].text,'Главное меню')
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:cancel')
         sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
-        self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('ЗАПИСЬ ОТМЕНЕНА',sent[0].text)
+        self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('Запись отменена',sent[0].text)
         self.assertEqual(sent[-1].text,'Главное меню')
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:cancel')
         self.assertFalse(any(isinstance(c.args[1],SendMessage) for c in self.session.make_request.call_args_list))
@@ -1122,15 +1122,16 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
         await self.new_participant();eid=await self.new_event(title='Заметный хакатон')
         async def sent_notice(bot,method,**kwargs):
-            if isinstance(method,SendMessage) and 'ТЫ ЗАПИСАН' in method.text:
+            if isinstance(method,SendMessage) and 'Ты записан' in method.text:
                 return SimpleNamespace(message_id=501,chat=SimpleNamespace(id=42))
             return True
         self.session.make_request.side_effect=sent_notice
         await self.send(callback=f'signup:{eid}:yes')
         sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
-        notice=next(m for m in sent if 'ТЫ ЗАПИСАН' in m.text)
-        self.assertIn('✅ ТЫ ЗАПИСАН!',notice.text);self.assertIn('Хакатон: Заметный хакатон',notice.text)
-        self.assertIn('15 секунд',notice.text)
+        notice=next(m for m in sent if 'Ты записан' in m.text)
+        self.assertIn('✅ Ты записан!',notice.text);self.assertIn('Хакатон: Заметный хакатон',notice.text)
+        self.assertNotIn('Сообщение исчезнет',notice.text)
+        self.assertIn('Условия участия и следующие шаги',notice.text)
         self.assertEqual(sent[-1].text,'Главное меню')
         rows=await self.db.pool.fetch('SELECT * FROM bot_notices')
         self.assertEqual(len(rows),1);self.assertEqual(rows[0]['message_id'],501)
@@ -1181,3 +1182,46 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         buttons=[b for row in message.reply_markup.inline_keyboard for b in row]
         self.assertEqual(sum(b.text=='Запись / подробнее' for b in buttons),1)
         self.assertFalse(any(b.callback_data.startswith('event:') for b in buttons))
+
+    async def test_registered_event_status_is_temporary_message_not_post_footer(self):
+        from app.handlers import build_router
+        from app.notices import NoticeCleaner
+        from aiogram.methods import SendMessage,EditMessageText
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        await self.new_participant()
+        sent_ids=[]
+        async def capture_notice(bot,method,**kwargs):
+            if isinstance(method,SendMessage):
+                mid=700+len(sent_ids);sent_ids.append(mid)
+                return SimpleNamespace(message_id=mid,chat=SimpleNamespace(id=42))
+            return True
+        self.session.make_request.side_effect=capture_notice
+        for formatted in (False,True):
+            eid=await self.new_event(title='FinTech Challenge: Банкинг будущего')
+            if formatted:
+                data=dict(await self.db.event_record(eid));data['body_html']='<b>Публичный пост</b>\nОписание'
+                await self.db.save_event(data,eid,1)
+            await self.db.register_event(eid,42,True)
+            self.session.make_request.reset_mock();await self.send(callback=f'event:{eid}')
+            methods=[c.args[1] for c in self.session.make_request.call_args_list]
+            post=next(m for m in methods if isinstance(m,EditMessageText))
+            self.assertNotIn('Ты записан:',post.text)
+            self.assertNotIn('Команда: нужна команда',post.text)
+            notices=[m for m in methods if isinstance(m,SendMessage)]
+            self.assertEqual(len(notices),1)
+            text=notices[0].text
+            self.assertTrue(text.startswith('✅ Ты записан!'))
+            self.assertIn('Хакатон: FinTech Challenge: Банкинг будущего',text)
+            self.assertIn('Команда: нужна команда',text)
+            self.assertIn('Условия участия и следующие шаги — в описании хакатона.',text)
+            self.assertNotIn('Это запись в боте',text);self.assertNotIn('Сообщение исчезнет',text)
+            self.assertIsNone(notices[0].reply_markup)
+            self.assertIn(f'signup:{eid}:cancel',[b.callback_data for row in post.reply_markup.inline_keyboard for b in row])
+            self.session.make_request.reset_mock();await self.send(callback=f'event:{eid}',uid=43)
+            self.assertFalse(any(isinstance(c.args[1],SendMessage) for c in self.session.make_request.call_args_list))
+        queued=await self.db.pool.fetch('SELECT message_id FROM bot_notices ORDER BY message_id')
+        self.assertEqual([r['message_id'] for r in queued],sent_ids)
+        await self.db.pool.execute("UPDATE bot_notices SET next_attempt_at=now()-interval '1 second'")
+        bot=SimpleNamespace(delete_message=AsyncMock())
+        await NoticeCleaner(self.db,bot).clean_once()
+        self.assertEqual([c.args[1] for c in bot.delete_message.call_args_list],sent_ids)

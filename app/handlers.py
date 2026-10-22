@@ -6,7 +6,7 @@ from aiogram.filters import Command,CommandStart
 from aiogram.exceptions import TelegramAPIError,TelegramBadRequest
 from aiogram.types import InlineKeyboardButton,InlineKeyboardMarkup,InputMediaPhoto,LinkPreviewOptions
 from app.events import status_of,STATUSES
-from app.notices import schedule_notice,NOTICE_SECONDS
+from app.notices import schedule_notice
 
 
 def keyboard(rows):
@@ -27,6 +27,15 @@ def when(value):
     from app.reports import MOSCOW
     if value is None: return 'не указано'
     return value.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M')+' МСК'
+
+
+def registration_status_text(title,needs_team=None,cancelled=False,updated=False):
+    if cancelled:
+        return f'❌ Запись отменена\n\nХакатон: {title}\nТвоя запись на этот хакатон отменена.'
+    heading='🔄 Запись обновлена' if updated else '✅ Ты записан!'
+    team='нужна команда' if needs_team else 'уже есть'
+    return (f'{heading}\n\nХакатон: {title}\nКоманда: {team}'
+            '\n\nУсловия участия и следующие шаги — в описании хакатона.')
 
 
 async def retire_context(message):
@@ -105,15 +114,16 @@ def build_router(db):
         if status=='open':
             rows.append([('🙋 Нужна команда',f'signup:{eid}:yes'),('👥 Команда есть',f'signup:{eid}:no')])
         if reg:
-            text+='\n\nТы записан: '+('нужна команда' if reg['needs_team'] else 'команда есть')
             rows.append([('Отменить запись',f'signup:{eid}:cancel')])
         rows.append([('← События','menu:events'),('В меню','menu:home')])
         if row.get('body_html'):
             header=f"{escape(row['title'])}\n{STATUSES[status]}\nНачало: {when(row['starts_at'])}\nОкончание: {when(row['ends_at'])}\nЗапись до: {when(row['registration_until'])}\n\n"
-            footer=('\n\nТы записан: '+('нужна команда' if reg['needs_team'] else 'команда есть')) if reg else ''
-            await context_text(message,header+row['body_html']+footer,replace=replace,reply_markup=keyboard(rows),parse_mode='HTML')
+            await context_text(message,header+row['body_html'],replace=replace,reply_markup=keyboard(rows),parse_mode='HTML')
         else:
             await context_text(message,text,replace=replace,reply_markup=keyboard(rows))
+        if reg:
+            notice=await message.answer(registration_status_text(row['title'],reg['needs_team']),parse_mode=None)
+            await schedule_notice(db,notice)
         await db.track('event_viewed',uid,{'event_id':eid})
 
     async def listing(message,page=1,replace=False,choose=False):
@@ -209,13 +219,8 @@ def build_router(db):
                     await context_text(callback.message,'Сначала заполни профиль, затем снова открой событие.',replace=True,reply_markup=keyboard([[('Заполнить профиль','menu:edit')]]));return
                 result=await db.register_event(eid,uid,parts[2]=='yes',parts[2]=='cancel')
                 if not result['changed']: return
-                if result['cancelled']:
-                    receipt=f"❌ ЗАПИСЬ ОТМЕНЕНА\n\nХакатон: {result['title']}\nТвоя запись в боте отменена."
-                else:
-                    status='🔄 ЗАПИСЬ ОБНОВЛЕНА' if result['was_active'] else '✅ ТЫ ЗАПИСАН!'
-                    receipt=f"{status}\n\nХакатон: {result['title']}\nКоманда: "+('нужна команда' if result['needs_team'] else 'уже есть')
-                    receipt+='\n\nЭто запись в боте; требования организатора смотри в описании.'
-                receipt+=f'\n\nСообщение исчезнет через {NOTICE_SECONDS} секунд. Статус доступен в «Мои записи».'
+                receipt=registration_status_text(result['title'],result['needs_team'],
+                    cancelled=result['cancelled'],updated=result['was_active'])
                 notice=await callback.message.answer(receipt,parse_mode=None)
                 await schedule_notice(db,notice)
                 await retire_context(callback.message)
