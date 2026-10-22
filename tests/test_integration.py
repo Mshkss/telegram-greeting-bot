@@ -917,12 +917,12 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         buttons=[b.callback_data for row in edited[0].reply_markup.inline_keyboard for b in row]
         self.assertIn('events:1',buttons);self.assertNotIn('events:3',buttons);self.assertIn('menu:home',buttons)
         self.session.make_request.reset_mock();await self.send(callback='menu:home')
-        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText)]
         self.assertEqual(sent[0].text,'Главное меню')
 
     async def test_formatted_event_delivery_and_empty_list(self):
         from app.handlers import build_router
-        from aiogram.methods import SendMessage
+        from aiogram.methods import SendMessage,EditMessageText
         self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
         await self.send('/events')
         sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
@@ -931,7 +931,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         e['body_html']='<b>Название</b>\n<u>Текст</u> <s>старое</s>'
         eid=await self.db.save_event(e)
         self.session.make_request.reset_mock();await self.send(callback=f'event:{eid}')
-        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText)]
         self.assertEqual(sent[0].parse_mode,'HTML');self.assertIn('<u>Текст</u>',sent[0].text)
 
     async def test_event_delete_authorization_stale_confirmation_and_related_records(self):
@@ -1019,3 +1019,46 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         message=next(c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText))
         buttons=[b for row in message.reply_markup.inline_keyboard for b in row]
         self.assertIn('Выбор 8',[b.text for b in buttons]);self.assertIn('choose_events:1',[b.callback_data for b in buttons])
+
+    async def test_navigation_reuses_messages_and_does_not_append_organizer_url(self):
+        from app.handlers import build_router
+        from aiogram.methods import SendMessage,SendPhoto,EditMessageText,EditMessageMedia
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        eid=await self.new_event(source_url='https://ostrovok.tech/hackathon/')
+        for callback in ('menu:events','choose_events:1',f'event:{eid}','menu:events','menu:home','menu:registrations'):
+            self.session.make_request.reset_mock();await self.send(callback=callback)
+            methods=[c.args[1] for c in self.session.make_request.call_args_list]
+            self.assertFalse(any(isinstance(m,(SendMessage,SendPhoto)) for m in methods),callback)
+            edited=[m for m in methods if isinstance(m,EditMessageText)]
+            self.assertEqual(len(edited),1,callback)
+            self.assertNotIn('Сайт организатора:',edited[0].text)
+            self.assertNotIn('ostrovok.tech',edited[0].text)
+        await self.new_participant()
+        self.session.make_request.reset_mock();await self.send(callback='menu:profile')
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        self.assertTrue(any(isinstance(m,EditMessageMedia) for m in methods))
+        self.assertFalse(any(isinstance(m,(SendMessage,SendPhoto)) for m in methods))
+        self.session.make_request.reset_mock();await self.send(callback=f'signup:{eid}:yes')
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        sent=[m for m in methods if isinstance(m,SendMessage)]
+        self.assertEqual(len(sent),1);self.assertIn('Запись сохранена',sent[0].text)
+        self.assertEqual(sum(isinstance(m,EditMessageText) for m in methods),1)
+        self.session.make_request.reset_mock();await self.send(callback='menu:registrations')
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        self.assertFalse(any(isinstance(m,SendMessage) for m in methods))
+        self.assertIn('Хакатон',next(m for m in methods if isinstance(m,EditMessageText)).text)
+
+    async def test_context_photo_return_and_unchanged_navigation(self):
+        from app.handlers import context_text,build_router
+        from aiogram.exceptions import TelegramBadRequest
+        from aiogram.methods import EditMessageText,SendMessage
+        photo=SimpleNamespace(photo=[object()],delete=AsyncMock(),answer=AsyncMock(),edit_reply_markup=AsyncMock())
+        await context_text(photo,'Главное меню',replace=True)
+        photo.delete.assert_awaited_once();photo.answer.assert_awaited_once()
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        async def unchanged(bot,method,**kwargs):
+            if isinstance(method,EditMessageText): raise TelegramBadRequest(method=method,message='Bad Request: message is not modified')
+            return True
+        self.session.make_request.side_effect=unchanged
+        await self.send(callback='menu:home')
+        self.assertFalse(any(isinstance(c.args[1],SendMessage) for c in self.session.make_request.call_args_list))

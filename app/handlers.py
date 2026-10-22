@@ -4,7 +4,7 @@ from html import escape
 from aiogram import F,Router
 from aiogram.filters import Command,CommandStart
 from aiogram.exceptions import TelegramAPIError,TelegramBadRequest
-from aiogram.types import InlineKeyboardButton,InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardButton,InlineKeyboardMarkup,InputMediaPhoto,LinkPreviewOptions
 from app.events import status_of,STATUSES
 
 
@@ -28,7 +28,38 @@ def when(value):
     return value.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M')+' МСК'
 
 
-async def prompt(message,draft):
+async def context_text(message,text,replace=False,**kwargs):
+    """Navigation edits its current screen; user commands and action receipts create messages."""
+    kwargs.setdefault('parse_mode',None)
+    kwargs.setdefault('link_preview_options',LinkPreviewOptions(is_disabled=True))
+    if replace:
+        if message.photo:
+            # Telegram has no media -> plain-text edit. Replace the photo screen instead.
+            try: await message.delete()
+            except TelegramBadRequest:
+                try: await message.edit_reply_markup(reply_markup=None)
+                except TelegramBadRequest: pass
+        else:
+            try: return await message.edit_text(text,**kwargs)
+            except TelegramBadRequest as error:
+                reason=error.message.lower()
+                if 'message is not modified' in reason: return
+                if not any(part in reason for part in ("message can't be edited",'message to edit not found','message_id_invalid')): raise
+                # An old screen may no longer be editable. Start a fresh usable screen.
+    return await message.answer(text,**kwargs)
+
+
+async def context_photo(message,file_id,text,replace=False,**kwargs):
+    if replace:
+        try: return await message.edit_media(InputMediaPhoto(media=file_id,caption=text,parse_mode=None),**kwargs)
+        except TelegramBadRequest as error:
+            reason=error.message.lower()
+            if 'message is not modified' in reason: return
+            if not any(part in reason for part in ("message can't be edited",'message to edit not found','message_id_invalid')): raise
+    return await message.answer_photo(file_id,caption=text,parse_mode=None,**kwargs)
+
+
+async def prompt(message,draft,replace=False):
     step=draft['step']; cb=lambda v:f"participant:{draft['version']}:{v}"
     texts={'consent':'Бот помогает записываться на хакатоны и другие командные события. Пока регистрация доступна с 18 лет. '
         'Имя, возраст, фото, стек и ваши записи доступны администратору; публичного каталога людей нет. '
@@ -39,12 +70,12 @@ async def prompt(message,draft):
         'photo':'Пришли фотографию или возьми доступное фото своего профиля Telegram.',
         'stack':'Укажи стек, навыки и роль в команде. Например: Python, FastAPI, backend. До 500 символов.'}
     if step=='preview':
-        await message.answer_photo(draft['data']['photo_file_id'],caption=caption(draft['data']),
+        await context_photo(message,draft['data']['photo_file_id'],caption(draft['data']),replace=replace,
             reply_markup=keyboard([[('✅ Сохранить',cb('save'))]]));return
     markup=None
     if step=='consent': markup=keyboard([[('Мне есть 18, продолжить',cb('agree'))]])
     if step=='photo': markup=keyboard([[('Взять фото из Telegram',cb('telegram_photo'))]])
-    await message.answer(texts[step],reply_markup=markup)
+    await context_text(message,texts[step],replace=replace,reply_markup=markup)
 
 
 def build_router(db):
@@ -52,12 +83,12 @@ def build_router(db):
     router.message.filter(F.chat.type=='private',F.from_user,~F.from_user.is_bot)
     router.callback_query.filter(F.message.chat.type=='private',~F.from_user.is_bot)
 
-    async def show_event(message,eid,uid):
+    async def show_event(message,eid,uid,replace=False):
         if not 0<eid<=2**63-1:
-            await message.answer('Неверный идентификатор события.');return
+            await context_text(message,'Неверный идентификатор события.',replace=replace,reply_markup=menu());return
         row=await db.event_record(eid)
         if not row or row['status']=='draft':
-            await message.answer('Событие недоступно.',reply_markup=menu());return
+            await context_text(message,'Событие недоступно.',replace=replace,reply_markup=menu());return
         status=status_of(row)
         reg=await db.pool.fetchrow('SELECT * FROM event_registrations WHERE event_id=$1 AND user_id=$2 AND active',eid,uid)
         text=f"{row['title']}\n{STATUSES[status]}\nНачало: {when(row['starts_at'])}\nОкончание: {when(row['ends_at'])}\nЗапись до: {when(row['registration_until'])}\n\n{row['body']}"
@@ -67,14 +98,13 @@ def build_router(db):
         if reg:
             text+='\n\nТы записан: '+('нужна команда' if reg['needs_team'] else 'команда есть')
             rows.append([('Отменить запись',f'signup:{eid}:cancel')])
-        rows.append([('← События','menu:events')])
+        rows.append([('← События','menu:events'),('В меню','menu:home')])
         if row.get('body_html'):
             header=f"{escape(row['title'])}\n{STATUSES[status]}\nНачало: {when(row['starts_at'])}\nОкончание: {when(row['ends_at'])}\nЗапись до: {when(row['registration_until'])}\n\n"
             footer=('\n\nТы записан: '+('нужна команда' if reg['needs_team'] else 'команда есть')) if reg else ''
-            await message.answer(header+row['body_html']+footer,reply_markup=keyboard(rows),parse_mode='HTML')
+            await context_text(message,header+row['body_html']+footer,replace=replace,reply_markup=keyboard(rows),parse_mode='HTML')
         else:
-            await message.answer(text,reply_markup=keyboard(rows),parse_mode=None)
-        if row['source_url']: await message.answer('Сайт организатора: '+row['source_url'])
+            await context_text(message,text,replace=replace,reply_markup=keyboard(rows))
         await db.track('event_viewed',uid,{'event_id':eid})
 
     async def listing(message,page=1,replace=False,choose=False):
@@ -96,41 +126,46 @@ def build_router(db):
         if page<pages: nav.append(('Далее →',f'{prefix}:{page+1}'))
         if nav: rows.append(nav)
         rows.append([('В меню','menu:home')])
-        method=message.edit_text if replace else message.answer
-        from aiogram.types import LinkPreviewOptions
-        try:
-            await method('\n\n'.join(lines),reply_markup=keyboard(rows),parse_mode='HTML',link_preview_options=LinkPreviewOptions(is_disabled=True))
-        except TelegramBadRequest as error:
-            if not replace or 'message is not modified' not in error.message.lower(): raise
+        await context_text(message,'\n\n'.join(lines),replace=replace,reply_markup=keyboard(rows),parse_mode='HTML')
+
+    async def registrations(message,uid,page=1,replace=False):
+        rows=await db.pool.fetch('''SELECT e.*,r.needs_team FROM events e JOIN event_registrations r ON r.event_id=e.id
+            WHERE r.user_id=$1 AND r.active ORDER BY e.starts_at DESC NULLS LAST,e.id LIMIT 100''',uid)
+        pages=max(1,(len(rows)+7)//8);page=min(max(1,page),pages)
+        lines=[f'Мои записи · {page}/{pages}'];buttons=[]
+        for e in rows[(page-1)*8:page*8]:
+            lines.append(f"{e['title']} · {STATUSES[status_of(e)]}\n"+('Нужна команда' if e['needs_team'] else 'Команда есть'))
+            buttons.append([(e['title'],f"event:{e['id']}")])
+        if not rows: lines.append('У тебя пока нет записей.')
+        nav=[]
+        if page>1: nav.append(('← Назад',f'registrations:{page-1}'))
+        if page<pages: nav.append(('Далее →',f'registrations:{page+1}'))
+        if nav: buttons.append(nav)
+        buttons.append([('В меню','menu:home')])
+        await context_text(message,'\n\n'.join(lines),replace=replace,reply_markup=keyboard(buttons))
 
     async def delete_version(uid):
         p=await db.participant(uid);d=await db.participant_draft(uid)
         return hashlib.sha256((str(p['updated_at'] if p else '')+str(d['version'] if d else '')).encode()).hexdigest()[:12]
 
-    async def action(message,user,name):
+    async def action(message,user,name,replace=False):
         uid=user.id
-        if name=='home': await message.answer('Главное меню',reply_markup=menu())
-        elif name=='events': await listing(message)
+        if name=='home': await context_text(message,'Главное меню',replace=replace,reply_markup=menu())
+        elif name=='events': await listing(message,replace=replace)
         elif name=='profile':
             p=await db.participant(uid)
-            if p: await message.answer_photo(p['photo_file_id'],caption=caption(p),reply_markup=menu())
-            else: await message.answer('Профиль не заполнен. Нажми «Изменить профиль».',reply_markup=menu())
+            if p: await context_photo(message,p['photo_file_id'],caption(p),replace=replace,reply_markup=menu())
+            else: await context_text(message,'Профиль не заполнен. Нажми «Изменить профиль».',replace=replace,reply_markup=menu())
         elif name=='edit':
             if not (await db.settings())['registrations_open'] and not await db.participant(uid):
-                await message.answer('Создание новых профилей временно приостановлено.');return
+                await context_text(message,'Создание новых профилей временно приостановлено.',replace=replace,reply_markup=menu());return
             draft=await db.save_participant_draft(uid,'consent',{'username':user.username})
-            await prompt(message,draft)
-        elif name=='registrations':
-            rows=await db.pool.fetch('''SELECT e.*,r.needs_team FROM events e JOIN event_registrations r ON r.event_id=e.id
-                WHERE r.user_id=$1 AND r.active ORDER BY e.starts_at DESC LIMIT 100''',uid)
-            if not rows: await message.answer('У тебя пока нет записей.',reply_markup=menu())
-            for e in rows:
-                await message.answer(f"{e['title']} · {STATUSES[status_of(e)]}\n"+('Нужна команда' if e['needs_team'] else 'Команда есть'),
-                    reply_markup=keyboard([[('Открыть',f"event:{e['id']}")]]))
+            await prompt(message,draft,replace=replace)
+        elif name=='registrations': await registrations(message,uid,replace=replace)
         elif name=='delete':
-            await message.answer('Удалить профиль и отменить все записи? Копия останется в закрытом архиве администратора.',
+            await context_text(message,'Удалить профиль и отменить все записи? Копия останется в закрытом архиве администратора.',replace=replace,
                 reply_markup=keyboard([[('Да, удалить','participant_delete:'+await delete_version(uid)),('Отмена','menu:profile')]]))
-        else: await message.answer('Это действие больше недоступно. Теперь бот помогает участвовать в событиях.',reply_markup=menu())
+        else: await context_text(message,'Это действие больше недоступно. Теперь бот помогает участвовать в событиях.',replace=replace,reply_markup=menu())
 
     @router.message(CommandStart())
     async def start(message):
@@ -152,18 +187,19 @@ def build_router(db):
         parts=(callback.data or '').split(':');uid=callback.from_user.id
         await callback.answer()
         try:
-            if parts[0]=='menu' and len(parts)==2: await action(callback.message,callback.from_user,parts[1])
+            if parts[0]=='menu' and len(parts)==2: await action(callback.message,callback.from_user,parts[1],replace=True)
             elif parts[0]=='events' and len(parts)==2 and parts[1].isdigit(): await listing(callback.message,max(1,min(int(parts[1]),100000)),replace=True)
             elif parts[0]=='choose_events' and len(parts)==2 and parts[1].isdigit(): await listing(callback.message,max(1,min(int(parts[1]),100000)),replace=True,choose=True)
-            elif parts[0]=='event' and len(parts)==2 and parts[1].isdigit(): await show_event(callback.message,int(parts[1]),uid)
+            elif parts[0]=='registrations' and len(parts)==2 and parts[1].isdigit(): await registrations(callback.message,uid,int(parts[1]),replace=True)
+            elif parts[0]=='event' and len(parts)==2 and parts[1].isdigit(): await show_event(callback.message,int(parts[1]),uid,replace=True)
             elif parts[0]=='signup' and len(parts)==3 and parts[1].isdigit() and parts[2] in ('yes','no','cancel'):
                 eid=int(parts[1])
                 if not 0<eid<=2**63-1: raise ValueError('Неверное событие')
                 if parts[2]!='cancel' and not await db.participant(uid):
-                    await callback.message.answer('Сначала заполни профиль, затем снова открой событие.',reply_markup=keyboard([[('Заполнить профиль','menu:edit')]]));return
+                    await context_text(callback.message,'Сначала заполни профиль, затем снова открой событие.',replace=True,reply_markup=keyboard([[('Заполнить профиль','menu:edit')]]));return
                 await db.register_event(eid,uid,parts[2]=='yes',parts[2]=='cancel')
                 await callback.message.answer('Запись отменена.' if parts[2]=='cancel' else 'Запись сохранена! Это запись в боте; требования организатора смотри в описании.')
-                await show_event(callback.message,eid,uid)
+                await show_event(callback.message,eid,uid,replace=True)
             elif parts[0]=='participant_delete' and len(parts)==2:
                 if parts[1]!=await delete_version(uid): raise ValueError('Подтверждение устарело. Открой удаление ещё раз.')
                 await db.finish_participant(uid,delete=True)
@@ -186,10 +222,10 @@ def build_router(db):
                     await callback.message.answer('Профиль сохранён. Теперь можно записываться на события.',reply_markup=menu());return
                 else: raise ValueError('Используй текущий шаг заполнения.')
                 draft=await db.save_participant_draft(uid,next_step,data)
-                await callback.message.edit_reply_markup(reply_markup=None);await prompt(callback.message,draft)
-            else: await callback.message.answer('Кнопка из старой версии. Нажми /start.',reply_markup=menu())
-        except ValueError as error: await callback.message.answer(str(error),reply_markup=menu())
-        except OverflowError: await callback.message.answer('Неверный идентификатор события.')
+                await prompt(callback.message,draft,replace=True)
+            else: await context_text(callback.message,'Кнопка из старой версии. Нажми /start.',replace=True,reply_markup=menu())
+        except ValueError as error: await context_text(callback.message,str(error),replace=True,reply_markup=menu())
+        except OverflowError: await context_text(callback.message,'Неверный идентификатор события.',replace=True,reply_markup=menu())
 
     @router.message()
     async def fill(message):

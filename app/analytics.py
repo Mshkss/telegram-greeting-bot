@@ -87,7 +87,7 @@ def action_code(event):
         parts = event.data.split(':')
         if parts[0] == 'menu' and len(parts) == 2 and parts[1] in ('profile','edit','browse','matches','hide','show','delete','events','registrations'):
             return 'menu_' + parts[1]
-        if parts[0] in ('event','events','choose_events','signup','participant','participant_delete'):
+        if parts[0] in ('event','events','choose_events','registrations','signup','participant','participant_delete'):
             return parts[0]
         if parts[0] == 'draft':
             return 'draft_button'
