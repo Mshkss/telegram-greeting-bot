@@ -48,9 +48,9 @@ button{background:#b6bcff;color:#11142b;cursor:pointer}table{border-collapse:col
 
 def page(title, content):
     return web.Response(text=f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · Знакомства</title>
-<style>{STYLE}</style></head><body><main><header><a href="{base_path()}/">💘 Знакомства / Админка</a>
-<nav><a href="{base_path()}/dashboard">Дашборд</a><a href="{base_path()}/profiles">Анкеты</a><a href="{base_path()}/users">Пользователи</a><a href="{base_path()}/settings">Настройки</a><a href="{base_path()}/access-log">Журнал входов</a></nav></header>{content}</main></body></html>''', content_type='text/html')
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · События</title>
+<style>{STYLE}</style></head><body><main><header><a href="{base_path()}/">События / Админка</a>
+<nav><a href="{base_path()}/dashboard">Дашборд</a><a href="{base_path()}/events">События</a><a href="{base_path()}/participants">Профили</a><a href="{base_path()}/users">Пользователи</a><a href="{base_path()}/settings">Настройки</a><a href="{base_path()}/access-log">Журнал входов</a></nav></header>{content}</main></body></html>''', content_type='text/html')
 
 
 
@@ -93,7 +93,7 @@ async def get_profile(request):
             raise ValueError
     except ValueError:
         raise web.HTTPNotFound(text='Анкета не найдена')
-    profile = await request.app[DB].profile(uid)
+    profile = await request.app[DB].participant(uid) if '/participants/' in request.path else await request.app[DB].profile(uid)
     if not profile:
         raise web.HTTPNotFound(text='Анкета не найдена')
     return profile
@@ -202,7 +202,7 @@ async def moderate(request):
     else:
         profile = await get_profile(request)
         uid = profile['user_id']
-        location = f'/profiles/{uid}'
+        location = f'/participants/{uid}' if '/participants/' in request.path else f'/profiles/{uid}'
     form = await request.post()
     action, token = form.get('action', ''), form.get('csrf', '')
     if action not in ('block', 'unblock') or not check_csrf(request, uid, action, token):
@@ -313,6 +313,9 @@ def create_app(settings, db=None, bot=None):
         web.get('/archive/{aid}/photo', photo), web.post('/archive/{aid}/moderation', moderate)])
     from app.admin_metrics import register_metrics
     register_metrics(app, DB, ADMIN_USER, page, csrf_token, check_csrf)
+    from app.admin_events import register_event_admin
+    register_event_admin(app, DB, page, csrf_token, check_csrf, photo, moderation_panel)
+    app.router.add_post('/participants/{uid}/moderation', moderate)
     register_access_log(app, DB, page)
     if prefix:
         # Both proxy_pass forms work: preserve /admin/... or strip it to /... .

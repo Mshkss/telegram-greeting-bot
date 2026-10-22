@@ -18,7 +18,7 @@ from aiogram.types import Update
 
 from app.admin import create_app
 from app.db import Database
-from app.handlers import build_router
+from app.legacy_handlers import build_router
 from app.telegram import ProxySession
 
 PROFILE = dict(name='Test', username='example', gender='male', age=25,
@@ -53,7 +53,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             admin_user='admin', admin_password='correct-long-password')
         self.db = await Database.connect(self.settings)
         await self.db.initialize()
-        await self.db.pool.execute('TRUNCATE profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,admin_access_events CASCADE')
+        await self.db.pool.execute('TRUNCATE event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,admin_access_events CASCADE')
         await self.db.pool.execute('UPDATE app_settings SET registrations_open=true')
         self.session = ProxySession('https://proxy.example', 'test-secret')
         self.session.make_request = AsyncMock(return_value=True)
@@ -273,11 +273,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_database_migration_is_idempotent_and_concurrent(self):
         await self.publish(42)
         # Simulate the previous production schema, retaining the actual profile.
-        await self.db.pool.execute('DROP TABLE admin_access_events,profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
+        await self.db.pool.execute('DROP TABLE event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,admin_access_events,profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 6)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 7)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -424,7 +424,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.pool.fetchval('SELECT status FROM analytics_attempts WHERE id=$1',attempt['id']),'published')
 
     async def test_analytics_view_only_after_delivery_and_empty_browse(self):
-        from app.handlers import browse
+        from app.legacy_handlers import browse
         from aiogram.exceptions import TelegramForbiddenError
         await self.publish(42)
         await self.publish(43)
@@ -731,3 +731,134 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         row=await self.db.pool.fetchrow('SELECT * FROM admin_access_events ORDER BY id DESC LIMIT 1')
         self.assertEqual(row['client_ip'],'127.0.0.1')
         self.assertFalse(row['forwarded'])
+
+    async def new_event(self,**changes):
+        from datetime import datetime,timedelta,timezone
+        now=datetime.now(timezone.utc)
+        data=dict(title='Хакатон',summary='Собираем команду',body='Подробности события',status='open',
+            starts_at=now+timedelta(days=5),ends_at=now+timedelta(days=7),registration_until=now+timedelta(days=4),source_url='https://example.com')
+        data.update(changes)
+        return await self.db.save_event(data)
+
+    async def new_participant(self,uid=42):
+        data=dict(name='Alice',age=22,stack='Python, backend',photo_file_id='photo',username='alice')
+        for step in ('consent','name','age','photo','stack','preview'):
+            draft=await self.db.save_participant_draft(uid,step,data)
+        self.assertTrue(await self.db.finish_participant(uid,draft['version']))
+
+    async def test_event_signup_atomic_idempotent_deadline_and_delete(self):
+        from datetime import datetime,timedelta,timezone
+        eid=await self.new_event()
+        with self.assertRaisesRegex(ValueError,'профиль'):
+            await self.db.register_event(eid,42,True)
+        await self.new_participant()
+        await asyncio.gather(self.db.register_event(eid,42,True),self.db.register_event(eid,42,True))
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='event_registered'"),1)
+        await self.db.register_event(eid,42,False)
+        self.assertFalse(await self.db.pool.fetchval('SELECT needs_team FROM event_registrations WHERE event_id=$1',eid))
+        await self.db.pool.execute('UPDATE events SET registration_until=$2 WHERE id=$1',eid,datetime.now(timezone.utc)-timedelta(seconds=1))
+        with self.assertRaisesRegex(ValueError,'закрыта'): await self.db.register_event(eid,42,True)
+        await self.db.register_event(eid,42,cancel=True)
+        self.assertFalse(await self.db.pool.fetchval('SELECT active FROM event_registrations WHERE event_id=$1',eid))
+        await self.db.pool.execute("UPDATE events SET registration_until=starts_at WHERE id=$1",eid)
+        await self.db.register_event(eid,42,True)
+        await self.db.finish_participant(42,delete=True)
+        self.assertIsNone(await self.db.participant(42))
+        self.assertFalse(await self.db.pool.fetchval('SELECT active FROM event_registrations WHERE event_id=$1',eid))
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM participant_archives'),1)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM event_revisions'),1)
+
+    async def test_new_bot_profile_upload_avatar_stale_and_legacy_callbacks(self):
+        from app.handlers import build_router
+        from app.analytics import ActivityMiddleware
+        self.dp=Dispatcher();self.dp.update.outer_middleware(ActivityMiddleware(self.db));self.dp.include_router(build_router(self.db))
+        await self.send('/start');self.assertIsNone(await self.db.participant_draft(42))
+        await self.send('/edit')
+        async def click(value):
+            d=await self.db.participant_draft(42)
+            await self.send(callback=f"participant:{d['version']}:{value}")
+        await click('agree');await self.send('Alice');await self.send('17')
+        self.assertEqual((await self.db.participant_draft(42))['step'],'age')
+        await self.send('22')
+        # No available Telegram avatar must preserve the photo step for upload.
+        self.session.make_request.return_value=SimpleNamespace(photos=[])
+        await click('telegram_photo')
+        self.assertEqual((await self.db.participant_draft(42))['step'],'photo')
+        self.session.make_request.return_value=True
+        await self.send(photo=True);await self.send('Python, backend')
+        old=await self.db.participant_draft(42)
+        await click('save');await self.send(callback=f"participant:{old['version']}:save")
+        self.assertEqual((await self.db.participant(42))['stack'],'Python, backend')
+        await self.send(callback='react:43:like');await self.send(callback='menu:browse')
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM reactions'),0)
+        eid=await self.new_event();await self.send(callback=f'signup:{eid}:yes')
+        self.assertTrue(await self.db.pool.fetchval('SELECT needs_team FROM event_registrations WHERE event_id=$1',eid))
+        await self.send('/edit');await click('agree');await self.send('Alice');await self.send('23')
+        self.session.make_request.return_value=SimpleNamespace(photos=[[SimpleNamespace(file_id='telegram-avatar')]])
+        await click('telegram_photo');self.session.make_request.return_value=True
+        self.assertEqual((await self.db.participant_draft(42))['data']['photo_file_id'],'telegram-avatar')
+        await self.send('/cancel')
+        self.assertEqual((await self.db.participant(42))['age'],22)
+
+    async def test_event_admin_prefix_csrf_revision_export_and_moderation(self):
+        import re
+        from app.reports import user_history_report
+        from app.admin_user import history_html
+        self.settings.admin_base_path='/admin'
+        await self.db.begin_update(9999,42,'events',display_name='Alice')
+        await self.new_participant()
+        eid=await self.new_event(title='<script>title</script>')
+        await self.db.register_event(eid,42,True)
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            self.assertEqual((await client.get('/admin/events')).status,401)
+            body=await (await client.get(f'/admin/events/{eid}',headers=auth)).text()
+            self.assertIn('&lt;script&gt;title&lt;/script&gt;',body);self.assertNotIn('<script>',body)
+            self.assertIn('Python, backend',body)
+            token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            e=await self.db.event_record(eid)
+            form={k:e[k] for k in ('title','summary','body','status','source_url')}
+            form.update({k:e[k].astimezone(__import__('app.reports',fromlist=['MOSCOW']).MOSCOW).strftime('%Y-%m-%dT%H:%M') for k in ('starts_at','ends_at','registration_until')})
+            form.update(csrf=token,revision='1',status='closed')
+            self.assertEqual((await client.post(f'/admin/events/{eid}',data={**form,'csrf':''},headers=auth)).status,403)
+            response=await client.post(f'/admin/events/{eid}',data=form,headers=auth,allow_redirects=False)
+            self.assertEqual(response.status,303);self.assertEqual(response.headers['Location'],f'/admin/events/{eid}')
+            self.assertEqual((await client.post(f'/admin/events/{eid}',data=form,headers=auth)).status,400)
+            csv=await (await client.get(f'/admin/events/{eid}/registrations.csv',headers=auth)).text()
+            self.assertIn('Python, backend',csv);self.assertIn('needs_team',csv)
+            body=await (await client.get('/admin/participants/42',headers=auth)).text()
+            self.assertIn('Python, backend',body)
+            token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            response=await client.post('/admin/participants/42/moderation',headers=auth,
+                data={'csrf':token,'action':'block','reason':'Test'},allow_redirects=False)
+            self.assertEqual(response.status,303)
+            with self.assertRaises(ValueError): await self.db.register_event(eid,42,False)
+        history=history_html(await user_history_report(self.db,42))
+        self.assertIn('Указал стек',history)
+        self.assertIn('Запись на событие',history)
+        self.assertIn('Нужна команда',history)
+
+    async def test_event_discovery_drafts_and_statuses(self):
+        from app.events import status_of
+        from datetime import datetime,timedelta,timezone
+        eid=await self.new_event();e=dict(await self.db.event_record(eid));now=datetime.now(timezone.utc)
+        self.assertEqual(status_of(e,now),'open')
+        self.assertEqual(status_of(e,e['registration_until']),'closed')
+        self.assertEqual(status_of(e,e['starts_at']),'ongoing')
+        self.assertEqual(status_of(e,e['ends_at']),'finished')
+        e['status']='cancelled';self.assertEqual(status_of(e,now),'cancelled')
+        e['status']='open'
+        imported=await self.db.save_event(e,origin='discovery',external_key='provider:item-1')
+        self.assertEqual((await self.db.event_record(imported))['status'],'draft')
+        self.assertNotIn(imported,[r['id'] for r in await self.db.event_list()])
+        with self.assertRaises(ValueError): await self.db.register_event(imported,42,True)
+
+    async def test_event_admin_entrypoint_uses_its_own_app_keys(self):
+        import runpy
+        namespace=runpy.run_module('app.admin',run_name='admin_entry_test')
+        await self.new_participant()
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(namespace['create_app'](self.settings,self.db,self.bot))) as client:
+            response=await client.get('/participants/42',headers=auth)
+            self.assertEqual(response.status,200)
+            self.assertIn('Python, backend',await response.text())

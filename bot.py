@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from aiogram import Dispatcher
+from aiogram.types import BotCommand
 
 from app.config import Settings
 from app.analytics import ActivityMiddleware
@@ -18,6 +19,10 @@ async def main():
         async with create_bot(settings, db) as bot:
             if (await bot.get_webhook_info()).url:
                 raise RuntimeError('Удалите webhook перед запуском polling.')
+            await bot.set_my_commands([BotCommand(command=command,description=description) for command,description in [
+                ('start','Главное меню'),('events','События и хакатоны'),('profile','Мой профиль'),
+                ('edit','Заполнить или изменить профиль'),('registrations','Мои записи'),
+                ('cancel','Отменить заполнение'),('delete','Удалить профиль и отменить записи')]])
             dp = Dispatcher()
             dp.update.outer_middleware(ActivityMiddleware(db))
             dp.include_router(build_router(db))

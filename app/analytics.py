@@ -85,8 +85,10 @@ def start_source(text):
 def action_code(event):
     if getattr(event, 'data', None):
         parts = event.data.split(':')
-        if parts[0] == 'menu' and len(parts) == 2 and parts[1] in ('profile','edit','browse','matches','hide','show','delete'):
+        if parts[0] == 'menu' and len(parts) == 2 and parts[1] in ('profile','edit','browse','matches','hide','show','delete','events','registrations'):
             return 'menu_' + parts[1]
+        if parts[0] in ('event','events','signup','participant','participant_delete'):
+            return parts[0]
         if parts[0] == 'draft':
             return 'draft_button'
         if parts[0] == 'react' and parts[-1] in ('like','skip'):
@@ -94,7 +96,7 @@ def action_code(event):
         return 'other_button'
     text = getattr(event, 'text', None) or ''
     command = text.split(maxsplit=1)[0].split('@')[0] if text else ''
-    if command in ('/start','/profile','/edit','/browse','/matches','/hide','/show','/delete','/cancel'):
+    if command in ('/start','/profile','/edit','/browse','/matches','/hide','/show','/delete','/cancel','/events','/registrations'):
         return command[1:]
     return 'photo' if getattr(event, 'photo', None) else 'message'
 

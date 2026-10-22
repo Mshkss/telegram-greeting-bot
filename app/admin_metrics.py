@@ -35,7 +35,7 @@ STEPS = [('started','Начал заполнение'), ('consent','Подтве
          ('age','Указал возраст'), ('photo','Добавил фото'), ('description','Добавил описание'),
          ('goals','Выбрал цели'), ('published','Опубликовал')]
 STEP_LABELS = {'consent':'Подтверждение 18+', 'gender':'Пол', 'age':'Возраст', 'photo':'Фото',
-               'description':'Описание', 'goals':'Цели', 'preview':'Предпросмотр'}
+               'description':'Описание', 'goals':'Цели', 'preview':'Предпросмотр', 'name':'Имя', 'stack':'Стек'}
 EVENT_LABELS = {
     'profile_viewed':'Доставленные карточки', 'profile_liked':'Лайки', 'profile_skipped':'Пропуски',
     'match_created':'Созданные взаимные симпатии', 'browse_empty':'Пустая выдача',
@@ -147,7 +147,8 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
         except ValueError as error:
             raise web.HTTPBadRequest(text=str(error))
         report = await dashboard_report(request.app[db_key], start, end)
-        return page('Дашборд', dashboard_html(report))
+        from app.event_dashboard import event_dashboard
+        return page('Дашборд', await event_dashboard(request.app[db_key],report))
 
     async def users(request):
         try:
@@ -169,6 +170,8 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
         for user in report['rows']:
             uid = user['user_id']
             state = []
+            if user['participant_exists']:
+                state.append(f'<a href="{base_path()}/participants/{uid}">Профиль участника</a>')
             if user['blocked']:
                 state.append('Заблокирован')
             if user['active'] is not None:
@@ -223,10 +226,10 @@ def register_metrics(app, db_key, user_key, page, csrf_token, check_csrf):
     async def settings_page(request):
         settings = await request.app[db_key].settings()
         checked = 'checked' if settings['registrations_open'] else ''
-        return page('Настройки', f'''<h1>Настройки</h1><section class="card"><h2>Приём новых анкет</h2>
+        return page('Настройки', f'''<h1>Настройки</h1><section class="card"><h2>Приём новых профилей</h2>
 <form method="post" class="moderation"><input type="hidden" name="csrf" value="{csrf_token(request,0,'settings')}">
-<label><input type="checkbox" name="registrations_open" value="yes" {checked}> Разрешить новые анкеты</label>
-<p class="muted">Пауза запрещает начинать новые анкеты. Уже начатые черновики можно закончить, существующие анкеты — редактировать.</p>
+<label><input type="checkbox" name="registrations_open" value="yes" {checked}> Разрешить новые профили</label>
+<p class="muted">Пауза запрещает начинать новые профили. Уже начатые черновики можно закончить, существующие анкеты — редактировать.</p>
 <button>Сохранить</button></form><p class="muted">Изменено: {esc(settings['updated_at'].astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M'))} МСК · {esc(settings['updated_by'])}</p></section>
 <section class="card"><h2>Правила аналитики</h2><dl><dt>Часовой пояс</dt><dd>Москва · UTC+3</dd>
 <dt>Новая сессия</dt><dd>После 30 минут без входящего действия (граница включительно)</dd>

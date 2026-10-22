@@ -12,7 +12,7 @@ STEPS = [('consent','Подтвердил 18+'),('gender','Указал пол')
          ('photo','Добавил фото'),('description','Добавил описание'),('goals','Выбрал цели')]
 STATUS = {'in_progress':'Не завершена','published':'Опубликована','cancelled':'Отменена',
           'restarted':'Начата заново','deleted':'Удалена'}
-ACTIONS = {key:'/'+key for key in ('start','profile','edit','browse','matches','hide','show','delete','cancel')}
+ACTIONS = {key:'/'+key for key in ('start','profile','edit','browse','matches','hide','show','delete','cancel','events','registrations')}
 ACTIONS.update({'message':'Сообщение','photo':'Фото','draft_button':'Кнопка заполнения',
     'like':'Кнопка «Лайк»','skip':'Кнопка «Пропуск»','other_button':'Другая кнопка'})
 ACTIONS.update({'menu_'+key:'Меню: '+label for key,label in {
@@ -22,6 +22,9 @@ LABELS = {**EVENT_LABELS, 'start_first':'Первый наблюдаемый /st
     'profile_fill_started':'Начало заполнения','profile_step_completed':'Шаг пройден',
     'profile_viewed':'Карточка доставлена','profile_liked':'Лайк','profile_skipped':'Пропуск',
     'match_created':'Взаимная симпатия','profile_published':'Анкета опубликована',
+    'participant_saved':'Профиль участника сохранён','participant_deleted':'Профиль участника удалён',
+    'participant_fill_started':'Заполнение профиля участника','participant_step_completed':'Шаг профиля пройден',
+    'event_registered':'Запись на событие','event_registration_cancelled':'Запись отменена','event_viewed':'Открыто событие',
     'profile_deleted':'Анкета удалена','draft_deleted':'Черновик удалён'}
 
 
@@ -47,7 +50,7 @@ def event_row(row, uid):
         title = LABELS.get(name,name)
     if name in ('start_first','start_repeat'):
         details.append('Источник: '+esc(props.get('source','unknown')))
-    if name in ('profile_step_completed','validation_error'):
+    if name in ('profile_step_completed','participant_step_completed','validation_error'):
         details.append(esc(STEP_LABELS.get(props.get('step'),props.get('step','—'))))
     if name in ('profile_viewed','profile_liked','profile_skipped','match_created'):
         target = row['user_id'] if name=='match_created' and row['user_id']!=uid else props.get('target_id')
@@ -56,6 +59,10 @@ def event_row(row, uid):
         details.append('Редактирование / повторная анкета' if props.get('is_edit') else 'Первая анкета')
         if props.get('legacy'):
             details.append('Продолжение старого черновика')
+    if isinstance(props.get('event_id'),int):
+        details.append(f'<a href="{base_path()}/events/{props["event_id"]}">Событие #{props["event_id"]}</a>')
+    if 'needs_team' in props:
+        details.append('Нужна команда' if props['needs_team'] else 'Команда есть')
     archive = props.get('archive_id')
     if name in ('profile_deleted','draft_deleted') and isinstance(archive,int):
         details.append(f'<a href="{base_path()}/archive/{archive}">Архив #{archive}</a>')
@@ -68,13 +75,16 @@ def event_row(row, uid):
 
 def attempt_card(attempt):
     completed = set(attempt['completed_steps'])
-    steps = ['Начал заполнение']+[label for code,label in STEPS if code in completed]
+    participant = attempt.get('format')=='participant'
+    steps_spec = [('consent','Подтвердил 18+'),('name','Указал имя'),('age','Указал возраст'),('photo','Добавил фото'),('stack','Указал стек')] if participant else STEPS
+    steps = ['Начал заполнение']+[label for code,label in steps_spec if code in completed]
     if attempt['status']=='published':
         steps.append('Опубликовал')
     progress = ' → '.join(esc(step) for step in steps)
     step = esc(STEP_LABELS.get(attempt['last_step'],attempt['last_step']))
     outcome = 'Ожидается: '+step if attempt['status']=='in_progress' else 'Последний шаг: '+step
     kind = 'Редактирование / повторная анкета' if attempt['is_edit'] else 'Первая анкета'
+    if participant: kind = 'Профиль участника · '+kind
     if attempt['legacy']:
         kind += ' · старый черновик, история неполная'
     return f'''<details class="card" open><summary><strong>{esc(STATUS.get(attempt['status'],attempt['status']))}</strong> · {esc(kind)} · {stamp(attempt['started_at'])}</summary>
@@ -102,14 +112,16 @@ def history_html(report):
             parts.append(link(data['page']+1,'Далее →'))
         return '<p>'+' · '.join(parts)+'</p>'
     links = [f'<a href="{base_path()}/users">← Пользователи</a>']
+    if user['participant_exists']:
+        links.append(f'<a href="{base_path()}/participants/{uid}">Профиль участника</a>')
     if user['active'] is not None:
         links.append(f'<a href="{base_path()}/profiles/{uid}">Текущая анкета</a>')
     if user['has_archive']:
         links.append(f'<a href="{base_path()}/archive?q={uid}">Архив анкет</a>')
     counts = {r['name']:r['total'] for r in report['counts']}
     metrics = ''.join([card('Входящие действия',report['updates']['total']),
-        card('Просмотры карточек',counts.get('profile_viewed',0)),card('Лайки',counts.get('profile_liked',0)),
-        card('Пропуски',counts.get('profile_skipped',0)),card('Взаимные симпатии',counts.get('match_created',0)),
+        card('Записи / изменения заявки',counts.get('event_registered',0)),card('Отмены записей',counts.get('event_registration_cancelled',0)),
+        *([card('Исторические лайки',counts.get('profile_liked',0)),card('Исторические симпатии',counts.get('match_created',0))] if counts.get('profile_liked') or counts.get('match_created') else []),
         card('Обработка p95',num(report['updates']['p95'],' мс'))])
     sessions = [(esc(r['id']),stamp(r['started_at']),stamp(r['last_activity']),
         num((r['last_activity']-r['started_at']).total_seconds(),' с'),r['actions']) for r in report['sessions']['rows']]

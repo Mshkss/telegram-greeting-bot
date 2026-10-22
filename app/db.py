@@ -116,7 +116,11 @@ PROFILE_SELECT = """SELECT p.*, coalesce(m.blocked,false) AS blocked,
     LEFT JOIN user_moderation m ON m.user_id=p.user_id """
 
 
-class Database(AnalyticsStore):
+from app.events import EventStore, SCHEMA as EVENTS_SCHEMA
+MIGRATIONS.append((7, EVENTS_SCHEMA))
+
+
+class Database(AnalyticsStore, EventStore):
     def __init__(self, pool):
         self.pool = pool
 
@@ -288,7 +292,8 @@ class Database(AnalyticsStore):
             async with conn.transaction():
                 await conn.execute('SELECT pg_advisory_xact_lock($1)', user_id)
                 exists = await conn.fetchval("""SELECT EXISTS(SELECT 1 FROM profiles WHERE user_id=$1)
-                    OR EXISTS(SELECT 1 FROM profile_archives WHERE user_id=$1)""", user_id)
+                    OR EXISTS(SELECT 1 FROM profile_archives WHERE user_id=$1)
+                    OR EXISTS(SELECT 1 FROM participants WHERE user_id=$1)""", user_id)
                 if not exists:
                     raise LookupError('Участник не найден')
                 changed = await conn.fetchval("""INSERT INTO user_moderation(user_id,blocked,reason)

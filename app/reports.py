@@ -75,9 +75,9 @@ async def dashboard_report(db, start, end, now=None):
                 count(*) FILTER(WHERE status='restarted') AS restarted,
                 count(*) FILTER(WHERE status='deleted') AS deleted,
                 count(*) FILTER(WHERE status='in_progress' AND last_activity < $3::timestamptz-interval '24 hours') AS stalled
-                FROM analytics_attempts WHERE NOT is_edit AND NOT legacy AND started_at >= $1 AND started_at < $2""", lo, hi, now)
+                FROM analytics_attempts WHERE format='legacy' AND NOT is_edit AND NOT legacy AND started_at >= $1 AND started_at < $2""", lo, hi, now)
             report['dropoffs'] = await c.fetch("""SELECT last_step,count(*) AS n
-                FROM analytics_attempts WHERE NOT is_edit AND NOT legacy
+                FROM analytics_attempts WHERE format='legacy' AND NOT is_edit AND NOT legacy
                 AND started_at >= $1 AND started_at < $2 AND status='in_progress'
                 AND last_activity < $3::timestamptz-interval '24 hours' GROUP BY last_step ORDER BY n DESC""", lo, hi, now)
             report['retention'] = await c.fetch("""WITH cohorts AS (
@@ -138,7 +138,7 @@ async def users_report(db, query='', page=1, start=None, end=None):
             total = await c.fetchval('SELECT count(*) FROM analytics_users u '+where, query,start,end)
             pages = max(1,(total+29)//30)
             page = min(max(1,page),pages)
-            rows = await c.fetch("""SELECT u.*,p.active,coalesce(m.blocked,false) AS blocked,
+            rows = await c.fetch("""SELECT u.*,p.active,EXISTS(SELECT 1 FROM participants ep WHERE ep.user_id=u.user_id) AS participant_exists,coalesce(m.blocked,false) AS blocked,
                 EXISTS(SELECT 1 FROM drafts d WHERE d.user_id=u.user_id) AS has_draft,
                 EXISTS(SELECT 1 FROM profile_archives a WHERE a.user_id=u.user_id) AS has_archive
                 FROM analytics_users u LEFT JOIN profiles p USING(user_id)
@@ -156,7 +156,7 @@ async def user_history_report(db, user_id, start=None, end=None, pages=None):
     report = {'start':start, 'end':end}
     async with db.pool.acquire() as c:
         async with c.transaction(isolation='repeatable_read', readonly=True):
-            user = await c.fetchrow("""SELECT u.*,p.active,coalesce(m.blocked,false) AS blocked,
+            user = await c.fetchrow("""SELECT u.*,p.active,EXISTS(SELECT 1 FROM participants ep WHERE ep.user_id=u.user_id) AS participant_exists,coalesce(m.blocked,false) AS blocked,
                 EXISTS(SELECT 1 FROM profile_archives a WHERE a.user_id=u.user_id) AS has_archive
                 FROM analytics_users u LEFT JOIN profiles p USING(user_id)
                 LEFT JOIN user_moderation m USING(user_id) WHERE u.user_id=$1""", user_id)
