@@ -192,16 +192,21 @@ class EventStore:
             row=await c.fetchrow('SELECT * FROM events WHERE id=$1 FOR UPDATE',eid)
             if not row or (row['status']=='draft' and not cancel): raise ValueError('Событие недоступно')
             old=await c.fetchrow('SELECT * FROM event_registrations WHERE event_id=$1 AND user_id=$2',eid,uid)
+            result={'changed':False,'title':row['title'],'needs_team':needs_team,
+                    'was_active':bool(old and old['active']),'cancelled':cancel}
             if cancel:
                 if old and old['active']:
+                    result['changed']=True
                     await c.execute('UPDATE event_registrations SET active=false,updated_at=now() WHERE event_id=$1 AND user_id=$2',eid,uid)
                     await event(c,'event_registration_cancelled',uid,{'event_id':eid})
-                return
+                return result
             if type(needs_team) is not bool: raise ValueError('Выберите, нужна ли команда')
             if status_of(row)!='open': raise ValueError('Регистрация уже закрыта')
             if await c.fetchval('SELECT blocked FROM user_moderation WHERE user_id=$1',uid): raise ValueError('Запись ограничена модератором')
             if not await c.fetchval('SELECT 1 FROM participants WHERE user_id=$1',uid): raise ValueError('Сначала заполните профиль')
-            if old and old['active'] and old['needs_team']==needs_team: return
+            if old and old['active'] and old['needs_team']==needs_team: return result
             await c.execute('''INSERT INTO event_registrations(event_id,user_id,needs_team) VALUES($1,$2,$3)
                 ON CONFLICT(event_id,user_id) DO UPDATE SET needs_team=$3,active=true,updated_at=now()''',eid,uid,needs_team)
             await event(c,'event_registered',uid,{'event_id':eid,'needs_team':needs_team})
+            result['changed']=True
+            return result

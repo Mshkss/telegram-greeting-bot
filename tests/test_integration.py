@@ -976,7 +976,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await self.db.pool.execute('DROP TRIGGER reject_event_delete ON events; DROP FUNCTION reject_event_delete()')
         results=await asyncio.gather(self.db.register_event(eid,42,False),self.db.delete_event(eid,1),return_exceptions=True)
-        self.assertTrue(all(x is None or isinstance(x,ValueError) for x in results))
+        self.assertTrue(all(x is None or isinstance(x,(ValueError,dict)) for x in results))
         self.assertIsNone(await self.db.event_record(eid))
         self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM event_registrations WHERE event_id=$1',eid),0)
 
@@ -1041,8 +1041,9 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{eid}:yes')
         methods=[c.args[1] for c in self.session.make_request.call_args_list]
         sent=[m for m in methods if isinstance(m,SendMessage)]
-        self.assertEqual(len(sent),1);self.assertIn('Запись сохранена',sent[0].text)
-        self.assertEqual(sum(isinstance(m,EditMessageText) for m in methods),1)
+        self.assertEqual(len(sent),2);self.assertIn('Запись сохранена',sent[0].text)
+        self.assertIn('Хакатон',sent[0].text);self.assertEqual(sent[1].text,'Главное меню')
+        self.assertEqual(sum(isinstance(m,EditMessageText) for m in methods),0)
         self.session.make_request.reset_mock();await self.send(callback='menu:registrations')
         methods=[c.args[1] for c in self.session.make_request.call_args_list]
         self.assertFalse(any(isinstance(m,SendMessage) for m in methods))
@@ -1062,3 +1063,54 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.session.make_request.side_effect=unchanged
         await self.send(callback='menu:home')
         self.assertFalse(any(isinstance(c.args[1],SendMessage) for c in self.session.make_request.call_args_list))
+
+    async def test_signup_receipts_name_the_event_and_move_complete_menu_to_bottom(self):
+        from app.handlers import build_router
+        from aiogram.methods import SendMessage,DeleteMessage,EditMessageText
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        await self.new_participant()
+        first=await self.new_event(title='Хакатон «Альфа»')
+        second=await self.new_event(title='Хакатон Бета')
+        for eid,title in ((first,'Хакатон «Альфа»'),(second,'Хакатон Бета')):
+            self.session.make_request.reset_mock();await self.send(callback=f'signup:{eid}:yes')
+            methods=[c.args[1] for c in self.session.make_request.call_args_list]
+            sent=[m for m in methods if isinstance(m,SendMessage)]
+            self.assertEqual(len(sent),2)
+            self.assertIn(title,sent[0].text);self.assertIn('Нужна команда',sent[0].text)
+            self.assertIsNone(sent[0].reply_markup)
+            self.assertEqual(sent[1].text,'Главное меню')
+            buttons={b.callback_data for row in sent[1].reply_markup.inline_keyboard for b in row}
+            self.assertEqual(buttons,{'menu:events','menu:registrations','menu:profile','menu:edit','menu:delete'})
+            removed=[m for m in methods if isinstance(m,DeleteMessage)]
+            self.assertEqual(len(removed),1);self.assertEqual(removed[0].message_id,self.seq)
+            self.assertLess(methods.index(sent[0]),methods.index(removed[0]))
+            self.assertLess(methods.index(removed[0]),methods.index(sent[1]))
+            self.assertFalse(any(isinstance(m,EditMessageText) for m in methods))
+            self.session.make_request.reset_mock();await self.send(callback=f'signup:{eid}:yes')
+            self.assertFalse(any(isinstance(c.args[1],(SendMessage,DeleteMessage)) for c in self.session.make_request.call_args_list))
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='event_registered'"),2)
+        self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:no')
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        self.assertIn('Запись обновлена',sent[0].text);self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('Команда есть',sent[0].text)
+        self.assertEqual(sent[-1].text,'Главное меню')
+        self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:cancel')
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('отменена',sent[0].text)
+        self.assertEqual(sent[-1].text,'Главное меню')
+        self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:cancel')
+        self.assertFalse(any(isinstance(c.args[1],SendMessage) for c in self.session.make_request.call_args_list))
+
+    async def test_signup_can_show_bottom_menu_if_old_menu_is_not_deletable(self):
+        from app.handlers import build_router
+        from aiogram.methods import DeleteMessage,SendMessage,EditMessageReplyMarkup
+        from aiogram.exceptions import TelegramBadRequest
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        await self.new_participant();eid=await self.new_event(title='Событие')
+        async def old_message(bot,method,**kwargs):
+            if isinstance(method,DeleteMessage): raise TelegramBadRequest(method=method,message="Bad Request: message can't be deleted")
+            return True
+        self.session.make_request.side_effect=old_message
+        await self.send(callback=f'signup:{eid}:yes')
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        self.assertTrue(any(isinstance(m,EditMessageReplyMarkup) and m.reply_markup is None for m in methods))
+        self.assertEqual([m.text for m in methods if isinstance(m,SendMessage)][-1],'Главное меню')

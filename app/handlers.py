@@ -28,6 +28,14 @@ def when(value):
     return value.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M')+' МСК'
 
 
+async def retire_context(message):
+    """Retire the old menu before placing a fresh menu below an action receipt."""
+    try: await message.delete()
+    except TelegramBadRequest:
+        try: await message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest: pass
+
+
 async def context_text(message,text,replace=False,**kwargs):
     """Navigation edits its current screen; user commands and action receipts create messages."""
     kwargs.setdefault('parse_mode',None)
@@ -197,9 +205,17 @@ def build_router(db):
                 if not 0<eid<=2**63-1: raise ValueError('Неверное событие')
                 if parts[2]!='cancel' and not await db.participant(uid):
                     await context_text(callback.message,'Сначала заполни профиль, затем снова открой событие.',replace=True,reply_markup=keyboard([[('Заполнить профиль','menu:edit')]]));return
-                await db.register_event(eid,uid,parts[2]=='yes',parts[2]=='cancel')
-                await callback.message.answer('Запись отменена.' if parts[2]=='cancel' else 'Запись сохранена! Это запись в боте; требования организатора смотри в описании.')
-                await show_event(callback.message,eid,uid,replace=True)
+                result=await db.register_event(eid,uid,parts[2]=='yes',parts[2]=='cancel')
+                if not result['changed']: return
+                if result['cancelled']:
+                    receipt=f"Запись на «{result['title']}» отменена."
+                else:
+                    action_label='Запись обновлена' if result['was_active'] else 'Запись сохранена'
+                    receipt=f"{action_label} на «{result['title']}»!\n"+('Нужна команда.' if result['needs_team'] else 'Команда есть.')
+                    receipt+='\nЭто запись в боте; требования организатора смотри в описании.'
+                await callback.message.answer(receipt,parse_mode=None)
+                await retire_context(callback.message)
+                await callback.message.answer('Главное меню',reply_markup=menu(),parse_mode=None)
             elif parts[0]=='participant_delete' and len(parts)==2:
                 if parts[1]!=await delete_version(uid): raise ValueError('Подтверждение устарело. Открой удаление ещё раз.')
                 await db.finish_participant(uid,delete=True)
