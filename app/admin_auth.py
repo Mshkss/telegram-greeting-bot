@@ -117,7 +117,7 @@ def auth_middleware(username, password, db_key, proxies):
                 response=web.Response(status=error.status,text=error.text,headers=error.headers)
         response.headers.update({'Cache-Control':'no-store','X-Content-Type-Options':'nosniff',
             'X-Frame-Options':'DENY','Referrer-Policy':'no-referrer',
-            'Content-Security-Policy':"default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
+            'Content-Security-Policy':"default-src 'none'; img-src 'self'; script-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"})
         return response
     return middleware
 

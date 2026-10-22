@@ -9,7 +9,7 @@ async def event_dashboard(db,r):
     counts=await db.pool.fetchrow('''SELECT (SELECT count(*) FROM participants) AS profiles,
         (SELECT count(*) FROM event_registrations WHERE active) AS registrations,
         (SELECT count(*) FROM event_registrations WHERE active AND needs_team) AS teams,
-        (SELECT count(*) FROM events WHERE status='open' AND registration_until>now()) AS open''')
+        (SELECT count(*) FROM events WHERE status='open' AND (registration_until IS NULL OR registration_until>now())) AS open''')
     attempts=await db.pool.fetch("SELECT * FROM analytics_attempts WHERE format='participant' AND NOT is_edit AND started_at >=$1 AND started_at<$2",lo,hi)
     funnel=[('Начал',len(attempts))]+[(label,sum(code in a['completed_steps'] for a in attempts)) for code,label in [('consent','Подтвердил 18+'),('name','Имя'),('age','Возраст'),('photo','Фото'),('stack','Стек')]]+[('Сохранил профиль',sum(a['status']=='published' for a in attempts))]
     labels={'participant_saved':'Профили сохранены','event_viewed':'Открытия событий','event_registered':'Записи и изменения ответа о команде','event_registration_cancelled':'Отмены записей','participant_deleted':'Удаления профиля'}

@@ -277,7 +277,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 7)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 8)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -862,3 +862,74 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             response=await client.get('/participants/42',headers=auth)
             self.assertEqual(response.status,200)
             self.assertIn('Python, backend',await response.text())
+
+    async def test_single_post_editor_persistence_and_sanitization(self):
+        import re,json
+        self.settings.admin_base_path='/admin'
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode()}
+        post='<b>Хакатон &amp; команды</b>\n<i>Присоединяйся</i>\n<blockquote>Цитата</blockquote>\n<tg-spoiler>Секрет</tg-spoiler>\n<code>Python</code>'
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            body=await (await client.get('/admin/events/new',headers=auth)).text()
+            self.assertNotIn('name="title"',body);self.assertNotIn('name="summary"',body)
+            self.assertIn('contenteditable="true"',body)
+            token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            form={'csrf':token,'revision':'0','status':'open','body_html':post,'channel_post_url':'https://t.me/hackathons/123'}
+            response=await client.post('/admin/events/new',headers=auth,data=form,allow_redirects=False)
+            self.assertEqual(response.status,303)
+            eid=int(response.headers['Location'].split('/')[-1])
+            e=await self.db.event_record(eid)
+            self.assertEqual(e['title'],'Хакатон & команды');self.assertEqual(e['body_html'],post)
+            self.assertIsNone(e['starts_at'])
+            self.assertEqual(json.loads(await self.db.pool.fetchval('SELECT payload FROM event_revisions WHERE event_id=$1',eid))['body_html'],post)
+            response=await client.get(f'/admin/events/{eid}',headers=auth)
+            body=await response.text();self.assertIn('<tg-spoiler>Секрет</tg-spoiler>',body)
+            script=await client.get('/admin/post-editor.js',headers=auth)
+            self.assertEqual(script.status,200);self.assertIn("script-src 'self'",script.headers['Content-Security-Policy'])
+            token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            bad=await client.post(f'/admin/events/{eid}',headers=auth,data={**form,'csrf':token,'revision':'1','body_html':'<script>alert(1)</script>'})
+            self.assertEqual(bad.status,400)
+            self.assertEqual((await self.db.event_record(eid))['revision'],1)
+            await self.new_participant()
+            await self.db.register_event(eid,42,True)  # Optional dates do not close registration.
+
+    async def test_bot_event_list_is_one_message_with_links_and_navigation(self):
+        from app.handlers import build_router
+        from aiogram.methods import SendMessage,EditMessageText
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        for i in range(9):
+            eid=await self.new_event(title=f'Хакатон {i}')
+            await self.db.pool.execute('UPDATE events SET channel_post_url=$2 WHERE id=$1',eid,f'https://t.me/hackathons/{i+1}')
+        await self.new_event(status='draft',title='HIDDEN_DRAFT')
+        self.session.make_request.reset_mock()
+        await self.send('/events')
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        sent=[m for m in methods if isinstance(m,SendMessage)]
+        self.assertEqual(len(sent),1)
+        self.assertIn('https://t.me/hackathons/',sent[0].text)
+        self.assertNotIn('HIDDEN_DRAFT',sent[0].text)
+        buttons=[b for row in sent[0].reply_markup.inline_keyboard for b in row]
+        self.assertIn('events:2',[b.callback_data for b in buttons]);self.assertIn('menu:home',[b.callback_data for b in buttons])
+        self.assertNotIn('events:0',[b.callback_data for b in buttons])
+        self.session.make_request.reset_mock()
+        await self.send(callback='events:2')
+        edited=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText)]
+        self.assertEqual(len(edited),1);self.assertIn('2/2',edited[0].text)
+        buttons=[b.callback_data for row in edited[0].reply_markup.inline_keyboard for b in row]
+        self.assertIn('events:1',buttons);self.assertNotIn('events:3',buttons);self.assertIn('menu:home',buttons)
+        self.session.make_request.reset_mock();await self.send(callback='menu:home')
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        self.assertEqual(sent[0].text,'Главное меню')
+
+    async def test_formatted_event_delivery_and_empty_list(self):
+        from app.handlers import build_router
+        from aiogram.methods import SendMessage
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        await self.send('/events')
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        self.assertEqual(len(sent),1);self.assertIn('Пока нет',sent[0].text)
+        e=dict(await self.db.event_record(await self.new_event()))
+        e['body_html']='<b>Название</b>\n<u>Текст</u> <s>старое</s>'
+        eid=await self.db.save_event(e)
+        self.session.make_request.reset_mock();await self.send(callback=f'event:{eid}')
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        self.assertEqual(sent[0].parse_mode,'HTML');self.assertIn('<u>Текст</u>',sent[0].text)

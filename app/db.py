@@ -118,6 +118,13 @@ PROFILE_SELECT = """SELECT p.*, coalesce(m.blocked,false) AS blocked,
 
 from app.events import EventStore, SCHEMA as EVENTS_SCHEMA
 MIGRATIONS.append((7, EVENTS_SCHEMA))
+MIGRATIONS.append((8, """
+ALTER TABLE events ADD COLUMN body_html TEXT;
+ALTER TABLE events ADD COLUMN channel_post_url TEXT NOT NULL DEFAULT '';
+ALTER TABLE events ALTER COLUMN starts_at DROP NOT NULL;
+ALTER TABLE events ALTER COLUMN ends_at DROP NOT NULL;
+ALTER TABLE events ALTER COLUMN registration_until DROP NOT NULL;
+"""))
 
 
 class Database(AnalyticsStore, EventStore):

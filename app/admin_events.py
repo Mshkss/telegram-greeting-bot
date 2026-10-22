@@ -7,9 +7,11 @@ from app.admin_urls import base_path,admin_url
 from app.admin_metrics import esc,table
 from app.events import STATUSES,status_of
 from app.reports import MOSCOW
+from app.post_format import parse_post
+from pathlib import Path
 
 
-def stamp(v): return v.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M')
+def stamp(v): return v.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M') if v else 'Не указано'
 
 
 def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_panel):
@@ -38,19 +40,33 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
             if not check_csrf(request,eid,'event',form.get('csrf','')): raise web.HTTPForbidden(text='Обновите форму')
             try:
                 data={k:form.get(k,'').strip() for k in ('title','summary','body','status','source_url')}
+                if 'body_html' in form:
+                    data['body_html']=form['body_html']
+                    data['source_url']=e['source_url'] if e else ''
+                data['channel_post_url']=form.get('channel_post_url','').strip()
                 for k in ('starts_at','ends_at','registration_until'):
-                    data[k]=datetime.strptime(form.get(k,''),'%Y-%m-%dT%H:%M').replace(tzinfo=MOSCOW)
+                    raw=form.get(k,'')
+                    data[k]=datetime.strptime(raw,'%Y-%m-%dT%H:%M').replace(tzinfo=MOSCOW) if raw else None
                 eid=await db.save_event(data,eid or None,int(form.get('revision','0')))
             except (ValueError,TypeError) as error: raise web.HTTPBadRequest(text=str(error))
             raise web.HTTPSeeOther(location=admin_url(f'/events/{eid}'))
         e=dict(e) if e else {'status':'draft'}
-        fields=''
-        for key,label,limit in [('title','Название',120),('summary','Краткое описание',350),('body','Пост / подробности',3000),('source_url','Сайт организатора',2000)]:
-            value=esc(e.get(key,''))
-            fields+=f'<label>{label}<textarea name="{key}" maxlength="{limit}" {"required" if key!="source_url" else ""}>{value}</textarea></label>'
+        from html import escape
+        stored=e.get('body_html')
+        post=parse_post(stored)[0] if stored else (('<b>'+escape(e.get('title',''))+'</b>\n\n'+escape(e.get('body',''))) if e.get('title') else '')
+        buttons=[('bold','Жирный','B'),('italic','Курсив','I'),('underline','Подчёркнутый','U'),
+            ('strike','Зачёркнутый','S'),('quote','Цитата','❯'),('code','Моноширинный','</>'),
+            ('spoiler','Скрытый','◧'),('link','Добавить ссылку','↗'),('date','Дата','Дата'),('clear','Очистить формат','Сброс')]
+        toolbar=''.join(f'<button type="button" data-format="{key}" title="{label}" aria-label="{label}">{esc(text)}</button>' for key,label,text in buttons)
+        fields=f'''<section class="post-composer"><div class="post-toolbar" role="toolbar" aria-label="Форматирование поста">{toolbar}</div>
+<div class="post-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Пост события" data-post-editor>{post}</div>
+<input type="hidden" name="body_html" value="{esc(post)}"><p class="muted"><span data-post-count></span> · Первая строка станет названием в списке.</p>
+<p class="muted">Выделите текст и выберите формат. ⌘/Ctrl+B, I, U, K. Вставка из буфера — обычным текстом.</p><p role="alert" data-post-error></p></section>
+<details><summary>Настройки события и записи</summary>'''
         for k,label in [('registration_until','Запись до'),('starts_at','Начало'),('ends_at','Окончание')]:
             value=e[k].astimezone(MOSCOW).strftime('%Y-%m-%dT%H:%M') if e.get(k) else ''
-            fields+=f'<label>{label} (МСК) <input type="datetime-local" name="{k}" value="{value}" required></label><br>'
+            fields+=f'<label>{label} (МСК) <input type="datetime-local" name="{k}" value="{value}"></label><br>'
+        fields+=f'<label>Ссылка на пост в канале <input type="url" name="channel_post_url" value="{esc(e.get("channel_post_url",""))}" placeholder="https://t.me/channel/123"></label><p class="muted">После подключения канала будет заполняться автоматически.</p>'
         options=''.join(f'<option value="{k}" {"selected" if e["status"]==k else ""}>{v}</option>' for k,v in STATUSES.items())
         controls=f'<input type="hidden" name="csrf" value="{csrf_token(request,eid,"event")}"><input type="hidden" name="revision" value="{e.get("revision",0)}">'
         registrations=''
@@ -60,7 +76,11 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
             counts=await db.pool.fetchrow('SELECT count(*) FILTER(WHERE active) AS total,count(*) FILTER(WHERE active AND needs_team) AS team FROM event_registrations WHERE event_id=$1',eid)
             items=[(f'<a href="{base_path()}/users/{r["user_id"]}">{r["user_id"]}</a>',esc(r['name'] or 'Профиль удалён'),esc(r['username'] or '—'),esc(r['stack'] or '—'), 'Нужна' if r['needs_team'] else 'Есть', 'Записан' if r['active'] else 'Отменена') for r in rows]
             registrations=f'<section class="card"><h2>Записи</h2><p>Активных: {counts["total"]} · Нужна команда: {counts["team"]}</p><a href="{base_path()}/events/{eid}/registrations.csv">Все записи CSV</a><p>Последние 100 записей; весь список — в CSV.</p>'+table(['Telegram ID','Имя','Username','Стек','Команда','Статус'],items)+'</section>'
-        return page('Событие',f'<h1>{esc(e.get("title","Новое событие"))}</h1><p>Черновики видны только администратору. Начало и окончание определяют фактический статус; дедлайн автоматически закрывает запись. Текст публикуется в боте без HTML-разметки.</p><form class="moderation" method="post">{controls}{fields}<label>Статус <select name="status">{options}</select></label><button>Сохранить</button></form>'+registrations)
+        return page('Событие',f'<h1>Пост события</h1><form class="moderation" method="post">{controls}{fields}<label>Статус <select name="status">{options}</select></label></details><button>Сохранить пост</button></form><script src="{base_path()}/post-editor.js" defer></script>'+registrations)
+
+    async def editor_script(request):
+        return web.Response(text=Path(__file__).with_name('post_editor.js').read_text(),content_type='application/javascript')
+
 
     async def export(request):
         eid=number(request.match_info['eid']);db=request.app[db_key]
@@ -103,7 +123,7 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
             items.append((r['id'],r['user_id'],esc(p.get('name','—')),esc(p.get('age','—')),esc(p.get('stack','—')),esc(stamp(r['deleted_at']))))
         return page('Архив профилей', '<h1>Последние 100 удалённых профилей</h1>'+table(['Архив','ID','Имя','Возраст','Стек','Удалён, МСК'],items))
 
-    app.add_routes([web.get('/events',listing),web.get('/events/new',edit),web.post('/events/new',edit),
+    app.add_routes([web.get('/post-editor.js',editor_script),web.get('/events',listing),web.get('/events/new',edit),web.post('/events/new',edit),
         web.get('/events/{eid}/registrations.csv',export),web.get('/events/{eid}',edit),web.post('/events/{eid}',edit),
         web.get('/participants',participants),web.get('/participants/{uid}',participants),
         web.get('/participants/{uid}/photo',photo),web.get('/participant-archive',archive)])

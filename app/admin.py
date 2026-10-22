@@ -32,6 +32,8 @@ def esc(value):
 
 
 STYLE = '''
+.post-composer{background:#18242e;border:1px solid #3c5265;border-radius:16px;margin:20px 0;padding:18px}.post-toolbar{display:flex;flex-wrap:wrap;gap:6px;border-bottom:1px solid #3c5265;padding-bottom:12px}.post-toolbar button{padding:8px 12px;min-width:40px;background:#273c4e;color:#edf0f7}.post-editor{min-height:300px;padding:22px 6px;outline:none;white-space:pre-wrap;overflow-wrap:anywhere;font-size:17px;line-height:1.6}.post-editor:empty:before{content:'Напишите пост, как в Telegram…';color:#9caabb}.post-editor blockquote{border-left:3px solid #7dbaf0;margin:8px 0;padding-left:14px;background:#223544}.post-editor tg-spoiler{background:#536778;border-radius:3px}.post-editor code{background:#101a22;border-radius:3px;padding:2px 4px}.post-toolbar button[title=Жирный]{font-weight:bold}.post-toolbar button[title=Курсив]{font-style:italic}
+
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#101319;color:#edf0f7;font:16px/1.6 system-ui,sans-serif}
 main{max-width:1120px;margin:40px auto;padding:0 24px}header{display:flex;justify-content:space-between;align-items:center;gap:16px}
 h1{font-size:32px;line-height:1.2}h2{margin-top:0}a{color:#b6bcff;text-decoration:none}a:hover{text-decoration:underline}
@@ -290,7 +292,7 @@ def create_app(settings, db=None, bot=None):
     prefix = normalize_base_path(getattr(settings, 'admin_base_path', ''))
     app = web.Application(middlewares=[prefix_middleware(prefix),
         auth_middleware(settings.admin_user, settings.admin_password, DB,
-            getattr(settings, 'admin_trusted_proxies', '127.0.0.1/32,::1/128'))], client_max_size=16384)
+            getattr(settings, 'admin_trusted_proxies', '127.0.0.1/32,::1/128'))], client_max_size=65536)
 
     async def resources(app):
         database = db or await Database.connect(settings)

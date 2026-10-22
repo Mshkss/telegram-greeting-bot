@@ -6,6 +6,7 @@ from uuid import uuid4
 from urllib.parse import urlsplit
 
 from app.analytics import event
+from app.post_format import parse_post,safe_url
 
 STATUSES = {'draft':'Черновик','open':'Регистрация открыта','closed':'Регистрация закрыта',
             'ongoing':'Идёт','finished':'Завершено','cancelled':'Отменено'}
@@ -47,9 +48,9 @@ def status_of(row, now=None):
     now=now or datetime.now(timezone.utc)
     if row['status'] in ('draft','cancelled','finished'):
         return row['status']
-    if now>=row['ends_at']: return 'finished'
-    if now>=row['starts_at']: return 'ongoing'
-    if row['status']=='closed' or now>=row['registration_until']: return 'closed'
+    if row['ends_at'] and now>=row['ends_at']: return 'finished'
+    if row['starts_at'] and now>=row['starts_at']: return 'ongoing'
+    if row['status']=='closed' or row['registration_until'] and now>=row['registration_until']: return 'closed'
     return row['status']
 
 
@@ -118,16 +119,33 @@ class EventStore:
     async def event_record(self,eid):
         return await self.pool.fetchrow('SELECT * FROM events WHERE id=$1',eid)
 
+    async def event_page(self,page=1):
+        async with self.pool.acquire() as c,c.transaction(isolation='repeatable_read',readonly=True):
+            total=await c.fetchval("SELECT count(*) FROM events WHERE status<>'draft'")
+            pages=max(1,(total+7)//8);page=min(max(1,page),pages)
+            rows=await c.fetch("""SELECT * FROM events WHERE status<>'draft' ORDER BY
+                CASE WHEN status='open' AND (registration_until IS NULL OR registration_until>now()) THEN 0
+                WHEN status NOT IN ('cancelled','finished') AND starts_at<=now() AND ends_at>now() THEN 1 ELSE 2 END,
+                starts_at NULLS LAST,id LIMIT 8 OFFSET $1""",(page-1)*8)
+        return rows,page,pages
+
     async def event_list(self,page=1,admin=False):
         where='' if admin else "WHERE status<>'draft'"
-        order='starts_at DESC,id DESC' if admin else "CASE WHEN status='open' AND registration_until>now() THEN 0 WHEN status NOT IN ('cancelled','finished') AND starts_at<=now() AND ends_at>now() THEN 1 ELSE 2 END,starts_at,id"
+        order='starts_at DESC NULLS LAST,id DESC' if admin else "CASE WHEN status='open' AND (registration_until IS NULL OR registration_until>now()) THEN 0 WHEN status NOT IN ('cancelled','finished') AND starts_at<=now() AND ends_at>now() THEN 1 ELSE 2 END,starts_at,id"
         return await self.pool.fetch('SELECT * FROM events '+where+' ORDER BY '+order+' LIMIT 10 OFFSET $1',(page-1)*10)
 
     async def save_event(self,data,eid=None,revision=None,origin='manual',external_key=None):
+        data=dict(data)
+        if data.get('body_html') is not None:
+            data['body_html'],data['body'],data['title']=parse_post(data['body_html'])
+            data['summary']=data['body'][:350]
+        if data.get('channel_post_url'): safe_url(data['channel_post_url'],channel=True)
+        if len(data.get('channel_post_url',''))>500: raise ValueError('Ссылка на пост слишком длинная')
         for k,limit in [('title',120),('summary',350),('body',3000)]:
             if not 1<=len(data.get(k,'').strip())<=limit: raise ValueError(f'{k}: от 1 до {limit} символов')
         if data['status'] not in STATUSES: raise ValueError('Неизвестный статус')
-        if not data['ends_at']>data['starts_at']>=data['registration_until']: raise ValueError('Дедлайн ≤ начало < окончание')
+        if data.get('ends_at') and data.get('starts_at') and data['ends_at']<=data['starts_at']: raise ValueError('Окончание должно быть после начала')
+        if data.get('registration_until') and data.get('starts_at') and data['registration_until']>data['starts_at']: raise ValueError('Дедлайн не позже начала')
         if len(data.get('source_url',''))>2000: raise ValueError('Ссылка: до 2000 символов')
         if data.get('source_url'):
             u=urlsplit(data['source_url'])
@@ -145,6 +163,12 @@ class EventStore:
                 if origin!='manual': vals[3]='draft'
                 eid=await c.fetchval('''INSERT INTO events(title,summary,body,status,starts_at,ends_at,registration_until,source_url,origin,external_key)
                     VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id''',*vals,origin,external_key)
+            if 'body_html' in data:
+                await c.execute('UPDATE events SET body_html=$2 WHERE id=$1',eid,data['body_html'])
+            elif eid:
+                await c.execute('UPDATE events SET body_html=NULL WHERE id=$1',eid)
+            if 'channel_post_url' in data:
+                await c.execute('UPDATE events SET channel_post_url=$2 WHERE id=$1',eid,data['channel_post_url'])
             await c.execute('INSERT INTO event_revisions(event_id,revision,payload) SELECT id,revision,to_jsonb(e) FROM events e WHERE id=$1',eid)
             await event(c,'event_updated',properties={'event_id':eid})
         return eid

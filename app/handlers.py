@@ -1,8 +1,9 @@
 """Private-chat event registration. Legacy dating callbacks never execute here."""
 import hashlib
+from html import escape
 from aiogram import F,Router
 from aiogram.filters import Command,CommandStart
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError,TelegramBadRequest
 from aiogram.types import InlineKeyboardButton,InlineKeyboardMarkup
 from app.events import status_of,STATUSES
 
@@ -23,6 +24,7 @@ def caption(p):
 
 def when(value):
     from app.reports import MOSCOW
+    if value is None: return 'не указано'
     return value.astimezone(MOSCOW).strftime('%d.%m.%Y %H:%M')+' МСК'
 
 
@@ -66,20 +68,37 @@ def build_router(db):
             text+='\n\nТы записан: '+('нужна команда' if reg['needs_team'] else 'команда есть')
             rows.append([('Отменить запись',f'signup:{eid}:cancel')])
         rows.append([('← События','menu:events')])
-        await message.answer(text,reply_markup=keyboard(rows),parse_mode=None)
+        if row.get('body_html'):
+            header=f"{escape(row['title'])}\n{STATUSES[status]}\nНачало: {when(row['starts_at'])}\nОкончание: {when(row['ends_at'])}\nЗапись до: {when(row['registration_until'])}\n\n"
+            footer=('\n\nТы записан: '+('нужна команда' if reg['needs_team'] else 'команда есть')) if reg else ''
+            await message.answer(header+row['body_html']+footer,reply_markup=keyboard(rows),parse_mode='HTML')
+        else:
+            await message.answer(text,reply_markup=keyboard(rows),parse_mode=None)
         if row['source_url']: await message.answer('Сайт организатора: '+row['source_url'])
         await db.track('event_viewed',uid,{'event_id':eid})
 
-    async def listing(message,page=1):
-        events=await db.event_list(page)
-        if not events: await message.answer('Пока нет событий на этой странице.',reply_markup=menu());return
-        for e in events:
-            await message.answer(f"{e['title']}\n{STATUSES[status_of(e)]} · {when(e['starts_at'])}\n{e['summary']}",
-                reply_markup=keyboard([[('Подробнее / записаться',f"event:{e['id']}")]]))
+    async def listing(message,page=1,replace=False):
+        events,page,pages=await db.event_page(page)
+        lines=[f'<b>События · {page}/{pages}</b>']
         rows=[]
-        if page>1: rows.append([('← Назад',f'events:{page-1}')])
-        if len(events)==10: rows.append([('Далее →',f'events:{page+1}')])
-        rows.append([('Главное меню','menu:home')]);await message.answer('События',reply_markup=keyboard(rows))
+        for i,e in enumerate(events,1):
+            title=escape(e['title'])
+            if e['channel_post_url']:
+                title=f'<a href="{escape(e["channel_post_url"],quote=True)}">{title}</a>'
+            lines.append(f"{i}. {title}\n{STATUSES[status_of(e)]}")
+            rows.append([(f'{i}. Запись / подробнее',f"event:{e['id']}")])
+        if not events: lines.append('Пока нет опубликованных событий.')
+        nav=[]
+        if page>1: nav.append(('← Назад',f'events:{page-1}'))
+        if page<pages: nav.append(('Далее →',f'events:{page+1}'))
+        if nav: rows.append(nav)
+        rows.append([('В меню','menu:home')])
+        method=message.edit_text if replace else message.answer
+        from aiogram.types import LinkPreviewOptions
+        try:
+            await method('\n\n'.join(lines),reply_markup=keyboard(rows),parse_mode='HTML',link_preview_options=LinkPreviewOptions(is_disabled=True))
+        except TelegramBadRequest as error:
+            if not replace or 'message is not modified' not in error.message.lower(): raise
 
     async def delete_version(uid):
         p=await db.participant(uid);d=await db.participant_draft(uid)
@@ -87,7 +106,8 @@ def build_router(db):
 
     async def action(message,user,name):
         uid=user.id
-        if name in ('home','events'): await listing(message)
+        if name=='home': await message.answer('Главное меню',reply_markup=menu())
+        elif name=='events': await listing(message)
         elif name=='profile':
             p=await db.participant(uid)
             if p: await message.answer_photo(p['photo_file_id'],caption=caption(p),reply_markup=menu())
@@ -130,7 +150,7 @@ def build_router(db):
         await callback.answer()
         try:
             if parts[0]=='menu' and len(parts)==2: await action(callback.message,callback.from_user,parts[1])
-            elif parts[0]=='events' and len(parts)==2 and parts[1].isdigit(): await listing(callback.message,max(1,min(int(parts[1]),100000)))
+            elif parts[0]=='events' and len(parts)==2 and parts[1].isdigit(): await listing(callback.message,max(1,min(int(parts[1]),100000)),replace=True)
             elif parts[0]=='event' and len(parts)==2 and parts[1].isdigit(): await show_event(callback.message,int(parts[1]),uid)
             elif parts[0]=='signup' and len(parts)==3 and parts[1].isdigit() and parts[2] in ('yes','no','cancel'):
                 eid=int(parts[1])
