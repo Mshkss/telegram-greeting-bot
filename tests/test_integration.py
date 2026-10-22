@@ -53,7 +53,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             admin_user='admin', admin_password='correct-long-password')
         self.db = await Database.connect(self.settings)
         await self.db.initialize()
-        await self.db.pool.execute('TRUNCATE event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,admin_access_events CASCADE')
+        await self.db.pool.execute('TRUNCATE bot_notices,event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,admin_access_events CASCADE')
         await self.db.pool.execute('UPDATE app_settings SET registrations_open=true')
         self.session = ProxySession('https://proxy.example', 'test-secret')
         self.session.make_request = AsyncMock(return_value=True)
@@ -273,11 +273,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_database_migration_is_idempotent_and_concurrent(self):
         await self.publish(42)
         # Simulate the previous production schema, retaining the actual profile.
-        await self.db.pool.execute('DROP TABLE event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,admin_access_events,profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
+        await self.db.pool.execute('DROP TABLE bot_notices,event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,admin_access_events,profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 8)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 9)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -1041,7 +1041,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{eid}:yes')
         methods=[c.args[1] for c in self.session.make_request.call_args_list]
         sent=[m for m in methods if isinstance(m,SendMessage)]
-        self.assertEqual(len(sent),2);self.assertIn('Запись сохранена',sent[0].text)
+        self.assertEqual(len(sent),2);self.assertIn('ТЫ ЗАПИСАН',sent[0].text)
         self.assertIn('Хакатон',sent[0].text);self.assertEqual(sent[1].text,'Главное меню')
         self.assertEqual(sum(isinstance(m,EditMessageText) for m in methods),0)
         self.session.make_request.reset_mock();await self.send(callback='menu:registrations')
@@ -1076,7 +1076,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             methods=[c.args[1] for c in self.session.make_request.call_args_list]
             sent=[m for m in methods if isinstance(m,SendMessage)]
             self.assertEqual(len(sent),2)
-            self.assertIn(title,sent[0].text);self.assertIn('Нужна команда',sent[0].text)
+            self.assertIn(title,sent[0].text);self.assertIn('нужна команда',sent[0].text)
             self.assertIsNone(sent[0].reply_markup)
             self.assertEqual(sent[1].text,'Главное меню')
             buttons={b.callback_data for row in sent[1].reply_markup.inline_keyboard for b in row}
@@ -1091,11 +1091,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE name='event_registered'"),2)
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:no')
         sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
-        self.assertIn('Запись обновлена',sent[0].text);self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('Команда есть',sent[0].text)
+        self.assertIn('ЗАПИСЬ ОБНОВЛЕНА',sent[0].text);self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('уже есть',sent[0].text)
         self.assertEqual(sent[-1].text,'Главное меню')
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:cancel')
         sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
-        self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('отменена',sent[0].text)
+        self.assertIn('Хакатон «Альфа»',sent[0].text);self.assertIn('ЗАПИСЬ ОТМЕНЕНА',sent[0].text)
         self.assertEqual(sent[-1].text,'Главное меню')
         self.session.make_request.reset_mock();await self.send(callback=f'signup:{first}:cancel')
         self.assertFalse(any(isinstance(c.args[1],SendMessage) for c in self.session.make_request.call_args_list))
@@ -1114,3 +1114,70 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         methods=[c.args[1] for c in self.session.make_request.call_args_list]
         self.assertTrue(any(isinstance(m,EditMessageReplyMarkup) and m.reply_markup is None for m in methods))
         self.assertEqual([m.text for m in methods if isinstance(m,SendMessage)][-1],'Главное меню')
+
+    async def test_signup_notice_is_separate_scheduled_and_deleted_without_menu(self):
+        from app.handlers import build_router
+        from app.notices import NoticeCleaner
+        from aiogram.methods import SendMessage
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        await self.new_participant();eid=await self.new_event(title='Заметный хакатон')
+        async def sent_notice(bot,method,**kwargs):
+            if isinstance(method,SendMessage) and 'ТЫ ЗАПИСАН' in method.text:
+                return SimpleNamespace(message_id=501,chat=SimpleNamespace(id=42))
+            return True
+        self.session.make_request.side_effect=sent_notice
+        await self.send(callback=f'signup:{eid}:yes')
+        sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
+        notice=next(m for m in sent if 'ТЫ ЗАПИСАН' in m.text)
+        self.assertIn('✅ ТЫ ЗАПИСАН!',notice.text);self.assertIn('Хакатон: Заметный хакатон',notice.text)
+        self.assertIn('15 секунд',notice.text)
+        self.assertEqual(sent[-1].text,'Главное меню')
+        rows=await self.db.pool.fetch('SELECT * FROM bot_notices')
+        self.assertEqual(len(rows),1);self.assertEqual(rows[0]['message_id'],501)
+        fake_bot=SimpleNamespace(delete_message=AsyncMock())
+        cleaner=NoticeCleaner(self.db,fake_bot)
+        await cleaner.clean_once();fake_bot.delete_message.assert_not_awaited()
+        await self.db.pool.execute("UPDATE bot_notices SET next_attempt_at=now()-interval '1 second'")
+        # A fresh worker finds queued notices after a process restart too.
+        await NoticeCleaner(self.db,fake_bot).clean_once()
+        fake_bot.delete_message.assert_awaited_once_with(42,501)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM bot_notices'),0)
+
+    async def test_notice_deletion_retries_rate_limit_and_accepts_already_removed(self):
+        from app.notices import schedule_notice,NoticeCleaner
+        from aiogram.exceptions import TelegramBadRequest,TelegramRetryAfter
+        from aiogram.methods import DeleteMessage
+        message=SimpleNamespace(message_id=502,chat=SimpleNamespace(id=42))
+        await schedule_notice(self.db,message,seconds=0)
+        await schedule_notice(self.db,message,seconds=0)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM bot_notices'),1)
+        bot=SimpleNamespace(delete_message=AsyncMock(side_effect=TelegramRetryAfter(
+            method=DeleteMessage(chat_id=42,message_id=502),message='retry',retry_after=7)))
+        await NoticeCleaner(self.db,bot).clean_once()
+        row=await self.db.pool.fetchrow('SELECT * FROM bot_notices')
+        self.assertEqual(row['attempts'],1);self.assertGreater(row['next_attempt_at'],row['delete_at'])
+        await self.db.pool.execute("UPDATE bot_notices SET next_attempt_at=now()-interval '1 second'")
+        bot.delete_message.side_effect=TelegramBadRequest(method=DeleteMessage(chat_id=42,message_id=502),message='message to delete not found')
+        await NoticeCleaner(self.db,bot).clean_once()
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM bot_notices'),0)
+        bot.delete_message.side_effect=None
+        async with NoticeCleaner(self.db,bot) as worker:
+            pass
+        self.assertTrue(worker.task.done())
+
+    async def test_event_choice_has_back_to_same_page_list(self):
+        from app.handlers import build_router
+        from aiogram.methods import EditMessageText,SendMessage
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        await self.new_event()
+        await self.send(callback='choose_events:1')
+        message=next(c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText))
+        back=[b for row in message.reply_markup.inline_keyboard for b in row if b.text=='← Назад']
+        self.assertEqual(len(back),1);self.assertEqual(back[0].callback_data,'events:1')
+        self.session.make_request.reset_mock();await self.send(callback=back[0].callback_data)
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        self.assertFalse(any(isinstance(m,SendMessage) for m in methods))
+        message=next(m for m in methods if isinstance(m,EditMessageText))
+        buttons=[b for row in message.reply_markup.inline_keyboard for b in row]
+        self.assertEqual(sum(b.text=='Запись / подробнее' for b in buttons),1)
+        self.assertFalse(any(b.callback_data.startswith('event:') for b in buttons))

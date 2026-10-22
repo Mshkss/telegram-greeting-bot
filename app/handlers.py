@@ -6,6 +6,7 @@ from aiogram.filters import Command,CommandStart
 from aiogram.exceptions import TelegramAPIError,TelegramBadRequest
 from aiogram.types import InlineKeyboardButton,InlineKeyboardMarkup,InputMediaPhoto,LinkPreviewOptions
 from app.events import status_of,STATUSES
+from app.notices import schedule_notice,NOTICE_SECONDS
 
 
 def keyboard(rows):
@@ -130,9 +131,10 @@ def build_router(db):
         if not events: lines.append('Пока нет опубликованных событий.')
         nav=[]
         prefix='choose_events' if choose else 'events'
-        if page>1: nav.append(('← Назад',f'{prefix}:{page-1}'))
+        if page>1: nav.append(('← Предыдущие' if choose else '← Назад',f'{prefix}:{page-1}'))
         if page<pages: nav.append(('Далее →',f'{prefix}:{page+1}'))
         if nav: rows.append(nav)
+        if choose: rows.append([('← Назад',f'events:{page}')])
         rows.append([('В меню','menu:home')])
         await context_text(message,'\n\n'.join(lines),replace=replace,reply_markup=keyboard(rows),parse_mode='HTML')
 
@@ -208,12 +210,14 @@ def build_router(db):
                 result=await db.register_event(eid,uid,parts[2]=='yes',parts[2]=='cancel')
                 if not result['changed']: return
                 if result['cancelled']:
-                    receipt=f"Запись на «{result['title']}» отменена."
+                    receipt=f"❌ ЗАПИСЬ ОТМЕНЕНА\n\nХакатон: {result['title']}\nТвоя запись в боте отменена."
                 else:
-                    action_label='Запись обновлена' if result['was_active'] else 'Запись сохранена'
-                    receipt=f"{action_label} на «{result['title']}»!\n"+('Нужна команда.' if result['needs_team'] else 'Команда есть.')
-                    receipt+='\nЭто запись в боте; требования организатора смотри в описании.'
-                await callback.message.answer(receipt,parse_mode=None)
+                    status='🔄 ЗАПИСЬ ОБНОВЛЕНА' if result['was_active'] else '✅ ТЫ ЗАПИСАН!'
+                    receipt=f"{status}\n\nХакатон: {result['title']}\nКоманда: "+('нужна команда' if result['needs_team'] else 'уже есть')
+                    receipt+='\n\nЭто запись в боте; требования организатора смотри в описании.'
+                receipt+=f'\n\nСообщение исчезнет через {NOTICE_SECONDS} секунд. Статус доступен в «Мои записи».'
+                notice=await callback.message.answer(receipt,parse_mode=None)
+                await schedule_notice(db,notice)
                 await retire_context(callback.message)
                 await callback.message.answer('Главное меню',reply_markup=menu(),parse_mode=None)
             elif parts[0]=='participant_delete' and len(parts)==2:

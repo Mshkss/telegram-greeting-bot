@@ -127,6 +127,10 @@ ALTER TABLE events ALTER COLUMN registration_until DROP NOT NULL;
 """))
 
 
+from app.notices import SCHEMA as NOTICES_SCHEMA
+MIGRATIONS.append((9, NOTICES_SCHEMA))
+
+
 class Database(AnalyticsStore, EventStore):
     def __init__(self, pool):
         self.pool = pool

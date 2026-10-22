@@ -8,6 +8,7 @@ from app.config import Settings
 from app.analytics import ActivityMiddleware
 from app.db import Database
 from app.handlers import build_router
+from app.notices import NoticeCleaner
 from app.telegram import ProxySession, create_bot
 
 
@@ -27,8 +28,9 @@ async def main():
             dp.update.outer_middleware(ActivityMiddleware(db))
             dp.include_router(build_router(db))
             # One polling process; sequential updates prevent onboarding races.
-            await dp.start_polling(bot, allowed_updates=['message', 'callback_query'],
-                                   polling_timeout=30, handle_as_tasks=False)
+            async with NoticeCleaner(db,bot):
+                await dp.start_polling(bot, allowed_updates=['message', 'callback_query'],
+                                       polling_timeout=30, handle_as_tasks=False)
     finally:
         await db.close()
 
