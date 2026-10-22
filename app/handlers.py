@@ -77,7 +77,7 @@ def build_router(db):
         if row['source_url']: await message.answer('Сайт организатора: '+row['source_url'])
         await db.track('event_viewed',uid,{'event_id':eid})
 
-    async def listing(message,page=1,replace=False):
+    async def listing(message,page=1,replace=False,choose=False):
         events,page,pages=await db.event_page(page)
         lines=[f'<b>События · {page}/{pages}</b>']
         rows=[]
@@ -86,11 +86,14 @@ def build_router(db):
             if e['channel_post_url']:
                 title=f'<a href="{escape(e["channel_post_url"],quote=True)}">{title}</a>'
             lines.append(f"{i}. {title}\n{STATUSES[status_of(e)]}")
-            rows.append([(f'{i}. Запись / подробнее',f"event:{e['id']}")])
+            if choose: rows.append([(e['title'],f"event:{e['id']}")])
+        if choose and events: lines.append('Выбери хакатон кнопкой ниже:')
+        if events and not choose: rows.append([('Запись / подробнее',f'choose_events:{page}')])
         if not events: lines.append('Пока нет опубликованных событий.')
         nav=[]
-        if page>1: nav.append(('← Назад',f'events:{page-1}'))
-        if page<pages: nav.append(('Далее →',f'events:{page+1}'))
+        prefix='choose_events' if choose else 'events'
+        if page>1: nav.append(('← Назад',f'{prefix}:{page-1}'))
+        if page<pages: nav.append(('Далее →',f'{prefix}:{page+1}'))
         if nav: rows.append(nav)
         rows.append([('В меню','menu:home')])
         method=message.edit_text if replace else message.answer
@@ -151,6 +154,7 @@ def build_router(db):
         try:
             if parts[0]=='menu' and len(parts)==2: await action(callback.message,callback.from_user,parts[1])
             elif parts[0]=='events' and len(parts)==2 and parts[1].isdigit(): await listing(callback.message,max(1,min(int(parts[1]),100000)),replace=True)
+            elif parts[0]=='choose_events' and len(parts)==2 and parts[1].isdigit(): await listing(callback.message,max(1,min(int(parts[1]),100000)),replace=True,choose=True)
             elif parts[0]=='event' and len(parts)==2 and parts[1].isdigit(): await show_event(callback.message,int(parts[1]),uid)
             elif parts[0]=='signup' and len(parts)==3 and parts[1].isdigit() and parts[2] in ('yes','no','cancel'):
                 eid=int(parts[1])

@@ -870,10 +870,10 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         post='<b>Хакатон &amp; команды</b>\n<i>Присоединяйся</i>\n<blockquote>Цитата</blockquote>\n<tg-spoiler>Секрет</tg-spoiler>\n<code>Python</code>'
         async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
             body=await (await client.get('/admin/events/new',headers=auth)).text()
-            self.assertNotIn('name="title"',body);self.assertNotIn('name="summary"',body)
+            self.assertIn('name="title"',body);self.assertNotIn('name="summary"',body)
             self.assertIn('contenteditable="true"',body)
             token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
-            form={'csrf':token,'revision':'0','status':'open','body_html':post,'channel_post_url':'https://t.me/hackathons/123'}
+            form={'csrf':token,'title':'Хакатон & команды','revision':'0','status':'open','body_html':post,'channel_post_url':'https://t.me/hackathons/123'}
             response=await client.post('/admin/events/new',headers=auth,data=form,allow_redirects=False)
             self.assertEqual(response.status,303)
             eid=int(response.headers['Location'].split('/')[-1])
@@ -933,3 +933,89 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.session.make_request.reset_mock();await self.send(callback=f'event:{eid}')
         sent=[c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage)]
         self.assertEqual(sent[0].parse_mode,'HTML');self.assertIn('<u>Текст</u>',sent[0].text)
+
+    async def test_event_delete_authorization_stale_confirmation_and_related_records(self):
+        import re
+        eid=await self.new_event();other=await self.new_event(title='Оставить')
+        await self.new_participant();await self.db.register_event(eid,42,True);await self.db.register_event(other,42,False)
+        self.settings.admin_base_path='/admin'
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            path=f'/admin/events/{eid}/delete'
+            self.assertEqual((await client.get(path)).status,401)
+            self.assertEqual((await client.post(path,data={})).status,401)
+            response=await client.get(path,headers=auth);body=await response.text()
+            token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            self.assertIsNotNone(await self.db.event_record(eid)) # GET only confirms.
+            self.assertEqual((await client.post(path,headers=auth,data={'revision':'1'})).status,403)
+            e=dict(await self.db.event_record(eid));e['title']='Новое имя'
+            await self.db.save_event(e,eid,1)
+            self.assertEqual((await client.post(path,headers=auth,data={'csrf':token,'revision':'1'})).status,400)
+            self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM event_registrations WHERE event_id=$1',eid),1)
+            response=await client.post(path,headers=auth,data={'csrf':token,'revision':'2'},allow_redirects=False)
+            self.assertEqual(response.status,303);self.assertEqual(response.headers['Location'],'/admin/events')
+            self.assertEqual((await client.get(path,headers=auth)).status,404)
+        self.assertIsNone(await self.db.event_record(eid))
+        for table in ('event_registrations','event_revisions'):
+            self.assertEqual(await self.db.pool.fetchval(f'SELECT count(*) FROM {table} WHERE event_id=$1',eid),0)
+            self.assertGreater(await self.db.pool.fetchval(f'SELECT count(*) FROM {table} WHERE event_id=$1',other),0)
+        self.assertEqual(await self.db.pool.fetchval("SELECT count(*) FROM analytics_events WHERE properties->>'event_id'=$1",str(eid)),0)
+        self.assertIsNotNone(await self.db.participant(42))
+
+    async def test_event_delete_rolls_back_and_serializes_with_registration(self):
+        import asyncpg
+        eid=await self.new_event();await self.new_participant();await self.db.register_event(eid,42,True)
+        await self.db.pool.execute("""CREATE FUNCTION reject_event_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'test delete failure'; END $$;
+            CREATE TRIGGER reject_event_delete BEFORE DELETE ON events FOR EACH ROW EXECUTE FUNCTION reject_event_delete()""")
+        try:
+            with self.assertRaises(asyncpg.RaiseError): await self.db.delete_event(eid,1)
+            self.assertIsNotNone(await self.db.event_record(eid))
+            self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM event_registrations WHERE event_id=$1',eid),1)
+            self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM event_revisions WHERE event_id=$1',eid),1)
+        finally:
+            await self.db.pool.execute('DROP TRIGGER reject_event_delete ON events; DROP FUNCTION reject_event_delete()')
+        results=await asyncio.gather(self.db.register_event(eid,42,False),self.db.delete_event(eid,1),return_exceptions=True)
+        self.assertTrue(all(x is None or isinstance(x,ValueError) for x in results))
+        self.assertIsNone(await self.db.event_record(eid))
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM event_registrations WHERE event_id=$1',eid),0)
+
+    async def test_internal_event_title_and_top_status_are_separate_from_post(self):
+        import re
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            body=await (await client.get('/events/new',headers=auth)).text()
+            self.assertLess(body.index('name="title"'),body.index('data-post-editor'))
+            self.assertLess(body.index('name="status"'),body.index('<details>'))
+            token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            response=await client.post('/events/new',headers=auth,data={'csrf':token,'title':'Название только для бота',
+                'status':'open','body_html':'<b>Публичный пост</b>\nОписание'},allow_redirects=False)
+            self.assertEqual(response.status,303)
+            eid=int(response.headers['Location'].split('/')[-1]);e=await self.db.event_record(eid)
+            self.assertEqual(e['title'],'Название только для бота')
+            self.assertNotIn('Название только для бота',e['body_html']);self.assertNotIn('Название только для бота',e['body'])
+            body=await (await client.get(f'/events/{eid}',headers=auth)).text()
+            self.assertIn('value="Название только для бота"',body)
+            self.assertIn('<b>Публичный пост</b>',body)
+
+    async def test_bot_single_gate_then_named_event_choice(self):
+        from app.handlers import build_router
+        from aiogram.methods import SendMessage,EditMessageText
+        self.dp=Dispatcher();self.dp.include_router(build_router(self.db))
+        ids=[await self.new_event(title=f'Выбор {i}') for i in range(9)]
+        self.session.make_request.reset_mock();await self.send('/events')
+        message=next(c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],SendMessage))
+        buttons=[b for row in message.reply_markup.inline_keyboard for b in row]
+        self.assertEqual(sum(b.text=='Запись / подробнее' for b in buttons),1)
+        self.assertFalse(any(b.callback_data.startswith('event:') for b in buttons))
+        self.session.make_request.reset_mock();await self.send(callback='choose_events:1')
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        self.assertFalse(any(isinstance(m,SendMessage) for m in methods))
+        message=next(m for m in methods if isinstance(m,EditMessageText))
+        buttons=[b for row in message.reply_markup.inline_keyboard for b in row]
+        self.assertEqual([b.text for b in buttons if b.callback_data.startswith('event:')],[f'Выбор {i}' for i in range(8)])
+        self.assertIn('choose_events:2',[b.callback_data for b in buttons]);self.assertIn('menu:home',[b.callback_data for b in buttons])
+        self.session.make_request.reset_mock();await self.send(callback='choose_events:2')
+        message=next(c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText))
+        buttons=[b for row in message.reply_markup.inline_keyboard for b in row]
+        self.assertIn('Выбор 8',[b.text for b in buttons]);self.assertIn('choose_events:1',[b.callback_data for b in buttons])

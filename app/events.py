@@ -137,7 +137,8 @@ class EventStore:
     async def save_event(self,data,eid=None,revision=None,origin='manual',external_key=None):
         data=dict(data)
         if data.get('body_html') is not None:
-            data['body_html'],data['body'],data['title']=parse_post(data['body_html'])
+            data['body_html'],data['body'],inferred_title=parse_post(data['body_html'])
+            if 'title' not in data: data['title']=inferred_title
             data['summary']=data['body'][:350]
         if data.get('channel_post_url'): safe_url(data['channel_post_url'],channel=True)
         if len(data.get('channel_post_url',''))>500: raise ValueError('Ссылка на пост слишком длинная')
@@ -172,6 +173,17 @@ class EventStore:
             await c.execute('INSERT INTO event_revisions(event_id,revision,payload) SELECT id,revision,to_jsonb(e) FROM events e WHERE id=$1',eid)
             await event(c,'event_updated',properties={'event_id':eid})
         return eid
+
+    async def delete_event(self,eid,revision):
+        """Remove event content and registrations atomically, serialized against sign-ups."""
+        async with self.pool.acquire() as c,c.transaction():
+            row=await c.fetchrow('SELECT revision FROM events WHERE id=$1 FOR UPDATE',eid)
+            if not row: raise LookupError('Событие не найдено')
+            if row['revision']!=revision: raise ValueError('Событие изменилось. Откройте подтверждение удаления заново.')
+            await c.execute('DELETE FROM event_registrations WHERE event_id=$1',eid)
+            await c.execute('DELETE FROM event_revisions WHERE event_id=$1',eid)
+            await c.execute("DELETE FROM analytics_events WHERE properties->>'event_id'=$1",str(eid))
+            await c.execute('DELETE FROM events WHERE id=$1',eid)
 
     async def register_event(self,eid,uid,needs_team=None,cancel=False):
         async with self.pool.acquire() as c,c.transaction():

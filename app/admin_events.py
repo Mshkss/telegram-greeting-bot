@@ -53,14 +53,14 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
         e=dict(e) if e else {'status':'draft'}
         from html import escape
         stored=e.get('body_html')
-        post=parse_post(stored)[0] if stored else (('<b>'+escape(e.get('title',''))+'</b>\n\n'+escape(e.get('body',''))) if e.get('title') else '')
+        post=parse_post(stored)[0] if stored else escape(e.get('body',''))
         buttons=[('bold','Жирный','B'),('italic','Курсив','I'),('underline','Подчёркнутый','U'),
             ('strike','Зачёркнутый','S'),('quote','Цитата','❯'),('code','Моноширинный','</>'),
             ('spoiler','Скрытый','◧'),('link','Добавить ссылку','↗'),('date','Дата','Дата'),('clear','Очистить формат','Сброс')]
         toolbar=''.join(f'<button type="button" data-format="{key}" title="{label}" aria-label="{label}">{esc(text)}</button>' for key,label,text in buttons)
         fields=f'''<section class="post-composer"><div class="post-toolbar" role="toolbar" aria-label="Форматирование поста">{toolbar}</div>
 <div class="post-editor" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Пост события" data-post-editor>{post}</div>
-<input type="hidden" name="body_html" value="{esc(post)}"><p class="muted"><span data-post-count></span> · Первая строка станет названием в списке.</p>
+<input type="hidden" name="body_html" value="{esc(post)}"><p class="muted"><span data-post-count></span> · Текст поста для Telegram.</p>
 <p class="muted">Выделите текст и выберите формат. ⌘/Ctrl+B, I, U, K. Вставка из буфера — обычным текстом.</p><p role="alert" data-post-error></p></section>
 <details><summary>Настройки события и записи</summary>'''
         for k,label in [('registration_until','Запись до'),('starts_at','Начало'),('ends_at','Окончание')]:
@@ -76,7 +76,29 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
             counts=await db.pool.fetchrow('SELECT count(*) FILTER(WHERE active) AS total,count(*) FILTER(WHERE active AND needs_team) AS team FROM event_registrations WHERE event_id=$1',eid)
             items=[(f'<a href="{base_path()}/users/{r["user_id"]}">{r["user_id"]}</a>',esc(r['name'] or 'Профиль удалён'),esc(r['username'] or '—'),esc(r['stack'] or '—'), 'Нужна' if r['needs_team'] else 'Есть', 'Записан' if r['active'] else 'Отменена') for r in rows]
             registrations=f'<section class="card"><h2>Записи</h2><p>Активных: {counts["total"]} · Нужна команда: {counts["team"]}</p><a href="{base_path()}/events/{eid}/registrations.csv">Все записи CSV</a><p>Последние 100 записей; весь список — в CSV.</p>'+table(['Telegram ID','Имя','Username','Стек','Команда','Статус'],items)+'</section>'
-        return page('Событие',f'<h1>Пост события</h1><form class="moderation" method="post">{controls}{fields}<label>Статус <select name="status">{options}</select></label></details><button>Сохранить пост</button></form><script src="{base_path()}/post-editor.js" defer></script>'+registrations)
+        heading=f'<label class="event-name">Название для бота <input style="display:block;width:100%;margin-top:8px" name="title" maxlength="120" value="{esc(e.get("title",""))}" required></label><p class="muted">Используется в списке и выборе хакатона. Это поле не добавляется в пост канала.</p><label>Статус <select name="status">{options}</select></label>'
+        removal=f'<p><a href="{base_path()}/events/{eid}/delete">Удалить хакатон и записи о нём</a></p>' if eid else ''
+        return page('Событие',f'<h1>Пост события</h1><form class="moderation" method="post">{controls}{heading}{fields}</details><button>Сохранить пост</button></form><script src="{base_path()}/post-editor.js" defer></script>'+registrations+removal)
+
+    async def delete(request):
+        eid=number(request.match_info['eid']);db=request.app[db_key]
+        e=await db.event_record(eid)
+        if not e: raise web.HTTPNotFound(text='Событие не найдено')
+        if request.method=='POST':
+            form=await request.post()
+            if not check_csrf(request,eid,'delete_event',form.get('csrf','')):
+                raise web.HTTPForbidden(text='Обновите подтверждение удаления')
+            try: await db.delete_event(eid,int(form.get('revision','0')))
+            except ValueError as error: raise web.HTTPBadRequest(text=str(error))
+            except LookupError: raise web.HTTPNotFound(text='Событие не найдено')
+            raise web.HTTPSeeOther(location=admin_url('/events'))
+        counts=await db.pool.fetchrow('SELECT count(*) AS total,count(*) FILTER(WHERE active) AS active FROM event_registrations WHERE event_id=$1',eid)
+        return page('Удаление хакатона',f'''<h1>Удалить «{esc(e['title'])}»?</h1>
+<p>Будут удалены хакатон, все его записи участников ({counts['total']}, активных: {counts['active']}), версии поста и связанные события аналитики.
+Профили пользователей сохранятся. Восстановить через админку нельзя. Уже опубликованный пост в Telegram-канале этим действием не удаляется.</p>
+<form method="post"><input type="hidden" name="csrf" value="{csrf_token(request,eid,'delete_event')}">
+<input type="hidden" name="revision" value="{e['revision']}"><button class="danger">Удалить хакатон и записи</button>
+<a href="{base_path()}/events/{eid}">Отмена</a></form>''')
 
     async def editor_script(request):
         return web.Response(text=Path(__file__).with_name('post_editor.js').read_text(),content_type='application/javascript')
@@ -124,6 +146,6 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
         return page('Архив профилей', '<h1>Последние 100 удалённых профилей</h1>'+table(['Архив','ID','Имя','Возраст','Стек','Удалён, МСК'],items))
 
     app.add_routes([web.get('/post-editor.js',editor_script),web.get('/events',listing),web.get('/events/new',edit),web.post('/events/new',edit),
-        web.get('/events/{eid}/registrations.csv',export),web.get('/events/{eid}',edit),web.post('/events/{eid}',edit),
+        web.get('/events/{eid}/delete',delete),web.post('/events/{eid}/delete',delete),web.get('/events/{eid}/registrations.csv',export),web.get('/events/{eid}',edit),web.post('/events/{eid}',edit),
         web.get('/participants',participants),web.get('/participants/{uid}',participants),
         web.get('/participants/{uid}/photo',photo),web.get('/participant-archive',archive)])
