@@ -53,7 +53,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             admin_user='admin', admin_password='correct-long-password')
         self.db = await Database.connect(self.settings)
         await self.db.initialize()
-        await self.db.pool.execute('TRUNCATE bot_notices,event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,admin_access_events CASCADE')
+        await self.db.pool.execute('TRUNCATE team_ui_drafts,team_applications,team_members,teams,event_preferences,matching_profiles,bot_notices,event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,profiles,drafts,reactions,profile_archives,user_moderation,moderation_events,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,admin_access_events CASCADE')
         await self.db.pool.execute('UPDATE app_settings SET registrations_open=true')
         self.session = ProxySession('https://proxy.example', 'test-secret')
         self.session.make_request = AsyncMock(return_value=True)
@@ -273,11 +273,11 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_database_migration_is_idempotent_and_concurrent(self):
         await self.publish(42)
         # Simulate the previous production schema, retaining the actual profile.
-        await self.db.pool.execute('DROP TABLE bot_notices,event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,admin_access_events,profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
+        await self.db.pool.execute('DROP TABLE team_ui_drafts,team_applications,team_members,teams,event_preferences,matching_profiles,bot_notices,event_revisions,event_registrations,events,participants,participant_drafts,participant_archives,admin_access_events,profile_archives,user_moderation,moderation_events,schema_migrations,analytics_users,analytics_sessions,analytics_updates,analytics_activity_days,analytics_events,analytics_attempts,app_settings; ALTER TABLE drafts DROP COLUMN attempt_id')
         await asyncio.gather(self.db.initialize(), self.db.initialize())
         self.assertEqual((await self.db.profile(42))['name'], PROFILE['name'])
         self.assertFalse((await self.db.profile(42))['blocked'])
-        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 9)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM schema_migrations'), 10)
         self.assertIsNotNone(await self.db.delete(42))
 
     async def test_admin_moderation_csrf_archive_access_and_unblock(self):
@@ -1080,7 +1080,7 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(sent[0].reply_markup)
             self.assertEqual(sent[1].text,'Главное меню')
             buttons={b.callback_data for row in sent[1].reply_markup.inline_keyboard for b in row}
-            self.assertEqual(buttons,{'menu:events','menu:registrations','menu:profile','menu:edit','menu:delete'})
+            self.assertEqual(buttons,{'menu:events','menu:registrations','menu:profile','menu:edit','menu:delete','menu:teams'})
             removed=[m for m in methods if isinstance(m,DeleteMessage)]
             self.assertEqual(len(removed),1);self.assertEqual(removed[0].message_id,self.seq)
             self.assertLess(methods.index(sent[0]),methods.index(removed[0]))
@@ -1225,3 +1225,253 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         bot=SimpleNamespace(delete_message=AsyncMock())
         await NoticeCleaner(self.db,bot).clean_once()
         self.assertEqual([c.args[1] for c in bot.delete_message.call_args_list],sent_ids)
+
+    async def matching_user(self,eid,uid,roles=None,hours='full'):
+        if not await self.db.participant(uid): await self.new_participant(uid)
+        await self.db.register_event(eid,uid,True)
+        await self.db.set_matching_profile(eid,uid,roles or ['backend'],'some',hours)
+
+    async def make_team(self,eid,uid=101,**changes):
+        return await self.db.create_team(eid,uid,{**dict(name='Команда Python',description='Делаем сервис',
+            wanted_roles=['backend','frontend'],tags='Python, JS',capacity=3,chat_url='https://t.me/+private-chat'),**changes})
+
+    async def test_team_consent_recommendations_privacy_and_visibility(self):
+        eid=await self.new_event()
+        for uid in (101,102,103): await self.matching_user(eid,uid)
+        await self.new_participant(104);await self.db.register_event(eid,104,True)
+        with self.assertRaisesRegex(ValueError,'заполни роли'): await self.make_team(eid,104)
+        tid=await self.make_team(eid)
+        rows=await self.db.team_catalog(eid,102)
+        self.assertEqual(rows[0]['id'],tid)
+        self.assertTrue(any('python' in r for r in rows[0]['reasons']))
+        self.assertTrue(any('время' in r for r in rows[0]['reasons']))
+        self.assertNotIn('chat_url',rows[0]);self.assertEqual((await self.db.team_detail(tid,102))['chat_url'],'')
+        self.assertEqual((await self.db.team_detail(tid,101))['chat_url'],'https://t.me/+private-chat')
+        self.assertEqual(await self.db.team_catalog(eid,101),[])
+        self.assertEqual({p['user_id'] for p in await self.db.candidates(tid,101)},{102,103})
+        await self.db.set_team_visibility(eid,103,False)
+        self.assertEqual({p['user_id'] for p in await self.db.candidates(tid,101)},{102})
+        await self.db.moderate(102,True,'Test','admin')
+        self.assertEqual(await self.db.candidates(tid,101),[])
+        with self.assertRaises(ValueError): await self.db.apply_team(tid,102,'backend','Привет')
+        with self.assertRaises(ValueError): await self.db.team_detail(tid,104+100)
+        with self.assertRaises(ValueError): await self.db.candidates(tid,102)
+
+    async def test_team_application_permissions_acceptance_chat_and_reapplication(self):
+        eid=await self.new_event()
+        for uid in (101,102,103): await self.matching_user(eid,uid)
+        tid=await self.make_team(eid)
+        aid=await self.db.apply_team(tid,102,'backend','Я пишу API')
+        with self.assertRaises(ValueError): await self.db.decide_application(aid,103,True)
+        with self.assertRaises(ValueError): await self.db.withdraw_application(aid,103)
+        changed,recipient,actual=await self.db.decide_application(aid,101,True)
+        self.assertEqual((changed,recipient,actual),(True,102,tid))
+        self.assertFalse((await self.db.decide_application(aid,101,True))[0])
+        self.assertTrue((await self.db.team_detail(tid,102))['chat_url'])
+        self.assertEqual((await self.db.team_detail(tid,102))['vacancies'],['frontend'])
+        self.assertFalse(await self.db.pool.fetchval('SELECT needs_team FROM event_registrations WHERE event_id=$1 AND user_id=102',eid))
+        with self.assertRaises(ValueError): await self.db.register_event(eid,102,True)
+        await self.db.manage_team(tid,102,'leave')
+        aid=await self.db.apply_team(tid,102,'backend','Вернулся')
+        self.assertTrue((await self.db.decide_application(aid,101,True))[0])
+
+    async def test_team_invitation_consent_permissions_and_opt_out(self):
+        eid=await self.new_event()
+        for uid in (101,102,103): await self.matching_user(eid,uid)
+        tid=await self.make_team(eid)
+        with self.assertRaises(ValueError): await self.db.apply_team(tid,102,'backend','Hi','invite',103)
+        await self.db.set_team_visibility(eid,102,False)
+        with self.assertRaises(ValueError): await self.db.apply_team(tid,102,'backend','Hi','invite',101)
+        await self.db.set_team_visibility(eid,102,True)
+        aid=await self.db.apply_team(tid,102,'backend','Hi','invite',101)
+        with self.assertRaises(ValueError): await self.db.decide_application(aid,101,True)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM team_members WHERE team_id=$1',tid),1)
+        self.assertEqual((await self.db.decide_application(aid,102,True))[:2],(True,101))
+
+    async def test_team_concurrent_accepts_one_team_per_event_and_other_pending_cancelled(self):
+        eid=await self.new_event()
+        for uid in (101,102,103): await self.matching_user(eid,uid)
+        first=await self.make_team(eid,101);second=await self.make_team(eid,102)
+        a=await self.db.apply_team(first,103,'backend','A');b=await self.db.apply_team(second,103,'backend','B')
+        results=await asyncio.gather(self.db.decide_application(a,101,True),self.db.decide_application(b,102,True))
+        self.assertEqual(sum(r[0] for r in results),1)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM team_members WHERE event_id=$1 AND user_id=103',eid),1)
+        statuses=await self.db.pool.fetch('SELECT status FROM team_applications WHERE user_id=103')
+        self.assertEqual({r['status'] for r in statuses},{'accepted','cancelled'})
+        other=await self.new_event();await self.matching_user(other,103)
+        self.assertTrue(await self.make_team(other,103))
+
+    async def test_team_capacity_race_and_changed_role_rechecked(self):
+        eid=await self.new_event()
+        await self.matching_user(eid,101);await self.matching_user(eid,102);await self.matching_user(eid,103,['frontend'])
+        tid=await self.db.create_team(eid,101,dict(name='Last place',description='X',wanted_roles=['backend','frontend'],capacity=2,tags='Python'))
+        a=await self.db.apply_team(tid,102,'backend','A');b=await self.db.apply_team(tid,103,'frontend','B')
+        await self.db.set_matching_profile(eid,102,['ml'],'some','full')
+        with self.assertRaisesRegex(ValueError,'изменил роли'): await self.db.decide_application(a,101,True)
+        await self.db.set_matching_profile(eid,102,['backend'],'some','full')
+        results=await asyncio.gather(self.db.decide_application(a,101,True),self.db.decide_application(b,101,True),return_exceptions=True)
+        self.assertEqual(sum(isinstance(r,tuple) and r[0] for r in results),1)
+        self.assertEqual(sum(isinstance(r,ValueError) for r in results),1)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM team_members WHERE team_id=$1',tid),2)
+        self.assertEqual(await self.db.team_catalog(eid,102 if isinstance(results[0],ValueError) else 103,True),[])
+
+    async def test_team_management_transfer_remove_leave_and_close(self):
+        eid=await self.new_event()
+        for uid in (101,102,103): await self.matching_user(eid,uid,['backend','frontend'])
+        tid=await self.make_team(eid)
+        a=await self.db.apply_team(tid,102,'backend','Hi');await self.db.decide_application(a,101,True)
+        with self.assertRaises(ValueError): await self.db.manage_team(tid,101,'leave')
+        with self.assertRaises(ValueError): await self.db.manage_team(tid,102,'chat',value='https://example.com')
+        await self.db.manage_team(tid,101,'transfer',target=102)
+        with self.assertRaises(ValueError): await self.db.manage_team(tid,101,'roles',value=['ml'])
+        await self.db.manage_team(tid,102,'chat',value='https://t.me/new-chat')
+        self.assertEqual((await self.db.team_detail(tid,101))['chat_url'],'https://t.me/new-chat')
+        b=await self.db.apply_team(tid,103,'frontend','Hi');await self.db.decide_application(b,102,True)
+        await self.db.manage_team(tid,102,'remove',target=103)
+        self.assertIsNone(await self.db.my_team(eid,103))
+        await self.db.manage_team(tid,102,'close')
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM team_members WHERE team_id=$1',tid),0)
+        self.assertFalse(await self.db.pool.fetchval('SELECT active FROM teams WHERE id=$1',tid))
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM event_registrations WHERE event_id=$1 AND active AND needs_team',eid),3)
+
+    async def test_team_cancel_registration_profile_delete_and_event_delete_cleanup(self):
+        eid=await self.new_event();other=await self.new_event()
+        for uid in (101,102,103): await self.matching_user(eid,uid)
+        await self.matching_user(other,102)
+        tid=await self.make_team(eid);other_tid=await self.make_team(other,102)
+        a=await self.db.apply_team(tid,102,'backend','Hi');await self.db.decide_application(a,101,True)
+        await self.db.save_team_draft(102,'application_message',{'eid':eid,'tid':tid})
+        await self.db.register_event(eid,102,cancel=True)
+        self.assertIsNone(await self.db.my_team(eid,102));self.assertIsNone(await self.db.team_draft(102))
+        self.assertEqual((await self.db.my_team(other,102))['id'],other_tid)
+        a=await self.db.apply_team(tid,103,'backend','Hi');await self.db.decide_application(a,101,True)
+        await self.db.finish_participant(101,delete=True)
+        self.assertIsNone(await self.db.my_team(eid,103))
+        self.assertTrue(await self.db.pool.fetchval('SELECT needs_team FROM event_registrations WHERE event_id=$1 AND user_id=103',eid))
+        await self.db.delete_event(eid,1)
+        for table in ('teams','team_members','event_preferences'):
+            self.assertEqual(await self.db.pool.fetchval(f'SELECT count(*) FROM {table} WHERE event_id=$1',eid),0)
+        self.assertEqual(await self.db.pool.fetchval('SELECT count(*) FROM team_applications'),0)
+        self.assertEqual((await self.db.my_team(other,102))['id'],other_tid)
+
+    async def test_team_unavailable_events_and_invalid_inputs(self):
+        eid=await self.new_event();await self.matching_user(eid,101);await self.matching_user(eid,102)
+        tid=await self.make_team(eid)
+        for status in ('finished','cancelled','draft'):
+            await self.db.pool.execute('UPDATE events SET status=$2 WHERE id=$1',eid,status)
+            with self.assertRaises(ValueError): await self.db.apply_team(tid,102,'backend','Hi')
+            with self.assertRaises(ValueError): await self.db.set_matching_profile(eid,102,['backend'],'some','full')
+        await self.db.pool.execute("UPDATE events SET status='open' WHERE id=$1",eid)
+        with self.assertRaises(ValueError): await self.db.manage_team(tid,101,'chat',value='javascript:alert(1)')
+        with self.assertRaises(ValueError): await self.db.set_matching_profile(eid,102,['bad'],'some','full')
+        with self.assertRaises(ValueError): await self.db.set_matching_profile(eid,102,['backend'],'bad','full')
+        await self.db.moderate(101,True,'Test','admin')
+        self.assertEqual(await self.db.team_catalog(eid,102),[])
+        with self.assertRaises(ValueError): await self.db.apply_team(tid,102,'backend','Hi')
+
+    async def test_team_bot_matching_and_team_creation_wizards_navigation(self):
+        from app.handlers import build_router as event_router
+        from aiogram.methods import EditMessageText,SendMessage
+        self.dp=Dispatcher();self.dp.include_router(event_router(self.db))
+        eid=await self.new_event();await self.new_participant();await self.db.register_event(eid,42,True)
+        await self.send(callback=f'tm:profile:{eid}')
+        async def choose(value):
+            d=await self.db.team_draft(42);await self.send(callback=f'tm:d:{d["version"]}:{value}')
+        await choose('agree');old=await self.db.team_draft(42);await choose('backend')
+        await self.send(callback=f'tm:d:{old["version"]}:frontend')
+        self.assertEqual((await self.db.team_draft(42))['data']['roles'],['backend'])
+        await choose('done');await choose('first');await choose('full')
+        self.assertIsNone(await self.db.team_draft(42))
+        await self.send(callback=f'tm:create:{eid}');await self.send('Новая команда');await self.send('Наш проект')
+        await choose('frontend');await choose('done');await self.send('React Python');await self.send('3');await choose('skip')
+        team=await self.db.my_team(eid,42);self.assertEqual(team['name'],'Новая команда')
+        self.assertIsNone(await self.db.team_draft(42))
+        self.session.make_request.reset_mock()
+        await self.send(callback=f'tm:list:{eid}:1:0');await self.send(callback=f'tm:home:{eid}');await self.send(callback='menu:teams')
+        methods=[c.args[1] for c in self.session.make_request.call_args_list]
+        self.assertEqual(sum(isinstance(m,EditMessageText) for m in methods),3)
+        self.assertFalse(any(isinstance(m,SendMessage) for m in methods))
+        self.assertTrue(any('Команды · 1/1' in (getattr(m,'text','') or '') for m in methods))
+
+    async def test_team_bot_invitation_and_application_permission_buttons(self):
+        from app.handlers import build_router as event_router
+        from aiogram.methods import EditMessageText
+        self.dp=Dispatcher();self.dp.include_router(event_router(self.db))
+        eid=await self.new_event()
+        for uid in (101,102): await self.matching_user(eid,uid)
+        tid=await self.make_team(eid)
+        await self.send(callback=f'tm:invite:{tid}:102:backend',uid=101)
+        aid=await self.db.pool.fetchval('SELECT id FROM team_applications')
+        self.session.make_request.reset_mock();await self.send(callback=f'tm:detail:{tid}',uid=102)
+        method=next(c.args[1] for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText))
+        callbacks=[b.callback_data for row in method.reply_markup.inline_keyboard for b in row]
+        self.assertIn(f'tm:accept:{aid}',callbacks)
+        self.assertNotIn('private-chat',method.text)
+        await self.send(callback=f'tm:accept:{aid}',uid=102)
+        self.assertEqual((await self.db.my_team(eid,102))['id'],tid)
+        await self.send(callback=f'tm:chat:{tid}',uid=102)
+        self.assertIsNone(await self.db.team_draft(102))
+
+    async def test_team_admin_prefix_auth_csrf_escaping_audit_and_metrics(self):
+        import re,json
+        eid=await self.new_event();await self.matching_user(eid,101);await self.matching_user(eid,102)
+        tid=await self.db.create_team(eid,101,dict(name='<script>alert(1)</script>',description='<b>X</b>',wanted_roles=['backend'],capacity=2,tags='Python'))
+        await self.db.apply_team(tid,102,'backend','<script>message</script>')
+        self.settings.admin_base_path='/admin'
+        auth={'Authorization':'Basic '+base64.b64encode(b'admin:correct-long-password').decode()}
+        async with TestClient(TestServer(create_app(self.settings,self.db,self.bot))) as client:
+            self.assertEqual((await client.get('/admin/teams')).status,401)
+            response=await client.get('/admin/teams',headers=auth);self.assertEqual(response.status,200)
+            body=await response.text();self.assertIn(f'/admin/teams/{tid}',body);self.assertNotIn('<script>alert',body)
+            response=await client.get(f'/admin/teams/{tid}',headers=auth);self.assertEqual(response.status,200)
+            body=await response.text();self.assertIn('&lt;script&gt;message',body)
+            token=re.search(r'name="csrf" value="([^"]+)"',body).group(1)
+            self.assertEqual((await client.post(f'/admin/teams/{tid}',headers=auth,data={'reason':'Spam'})).status,403)
+            response=await client.post(f'/admin/teams/{tid}',headers=auth,data={'csrf':token,'reason':'<script>spam</script>'},allow_redirects=False)
+            self.assertEqual(response.status,303);self.assertEqual(response.headers['Location'],f'/admin/teams/{tid}')
+            body=await (await client.get(f'/admin/teams/{tid}',headers=auth)).text()
+            self.assertIn('&lt;script&gt;spam',body);self.assertIn('Команда распущена',body)
+            self.assertEqual((await client.get(f'/admin/participants/102',headers=auth)).status,200)
+            body=await (await client.get('/admin/dashboard',headers=auth)).text()
+            self.assertIn('Команд сейчас',body);self.assertIn('Роспуски модератором',body)
+        self.assertFalse(await self.db.pool.fetchval('SELECT active FROM teams WHERE id=$1',tid))
+        self.assertEqual(await self.db.pool.fetchval('SELECT status FROM team_applications'),'cancelled')
+        props=json.loads(await self.db.pool.fetchval("SELECT properties FROM analytics_events WHERE name='team_moderated'"))
+        self.assertEqual(props['moderator'],'admin')
+
+    async def test_team_bot_application_and_invitation_withdrawal(self):
+        from app.handlers import build_router as event_router
+        self.dp=Dispatcher();self.dp.include_router(event_router(self.db))
+        eid=await self.new_event()
+        for uid in (101,102,103): await self.matching_user(eid,uid)
+        tid=await self.make_team(eid)
+        await self.send(callback=f'tm:apply:{tid}:backend',uid=102)
+        await self.send('Пишу Python API',uid=102)
+        self.assertIsNone(await self.db.team_draft(102))
+        aid=await self.db.pool.fetchval('SELECT id FROM team_applications WHERE user_id=102')
+        await self.send(callback=f'tm:accept:{aid}',uid=101)
+        self.assertEqual((await self.db.my_team(eid,102))['id'],tid)
+        await self.db.manage_team(tid,102,'leave')
+        aid=await self.db.apply_team(tid,103,'backend','Invite','invite',101)
+        await self.send(callback=f'tm:withdraw:{aid}',uid=101)
+        self.assertEqual(await self.db.pool.fetchval('SELECT status FROM team_applications WHERE id=$1',aid),'withdrawn')
+        self.assertFalse((await self.db.decide_application(aid,103,True))[0])
+        await self.send(callback=f'tm:visibility:{eid}:0',uid=103)
+        self.assertFalse(await self.db.pool.fetchval('SELECT needs_team FROM event_registrations WHERE event_id=$1 AND user_id=103',eid))
+        await self.send(callback=f'tm:visibility:{eid}:1',uid=103)
+        self.assertTrue(await self.db.pool.fetchval('SELECT needs_team FROM event_registrations WHERE event_id=$1 AND user_id=103',eid))
+
+    async def test_team_telegram_screens_fit_long_unicode_content(self):
+        from app.handlers import build_router as event_router
+        from aiogram.methods import EditMessageText
+        self.dp=Dispatcher();self.dp.include_router(event_router(self.db))
+        eid=await self.new_event()
+        for uid in range(101,104):
+            await self.matching_user(eid,uid)
+            await self.db.pool.execute('UPDATE participants SET name=$2,stack=$3 WHERE user_id=$1',uid,'😀'*64,'😀'*500)
+        tid=await self.make_team(eid,name='😀'*64,description='😀'*500)
+        for uid in (102,103): await self.db.apply_team(tid,uid,'backend','😀'*300)
+        for callback in (f'tm:requests:{tid}:1',f'tm:people:{tid}:1',f'tm:detail:{tid}'):
+            self.session.make_request.reset_mock();await self.send(callback=callback,uid=101)
+            text=next(c.args[1].text for c in self.session.make_request.call_args_list if isinstance(c.args[1],EditMessageText))
+            self.assertLessEqual(len(text.encode('utf-16-le'))//2,4096)

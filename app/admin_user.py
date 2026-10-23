@@ -61,6 +61,10 @@ def event_row(row, uid):
             details.append('Продолжение старого черновика')
     if isinstance(props.get('event_id'),int):
         details.append(f'<a href="{base_path()}/events/{props["event_id"]}">Событие #{props["event_id"]}</a>')
+    if name in ('team_member_removed','team_captain_changed'):
+        details.append('Участник: '+user_link(props.get('target_id')))
+    if isinstance(props.get('team_id'),int):
+        details.append(f'<a href="{base_path()}/teams/{props["team_id"]}">Команда #{props["team_id"]}</a>')
     if 'needs_team' in props:
         details.append('Нужна команда' if props['needs_team'] else 'Команда есть')
     archive = props.get('archive_id')

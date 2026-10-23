@@ -52,7 +52,7 @@ def page(title, content):
     return web.Response(text=f'''<!doctype html><html lang="ru"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} · События</title>
 <style>{STYLE}</style></head><body><main><header><a href="{base_path()}/">События / Админка</a>
-<nav><a href="{base_path()}/dashboard">Дашборд</a><a href="{base_path()}/events">События</a><a href="{base_path()}/participants">Профили</a><a href="{base_path()}/users">Пользователи</a><a href="{base_path()}/settings">Настройки</a><a href="{base_path()}/access-log">Журнал входов</a></nav></header>{content}</main></body></html>''', content_type='text/html')
+<nav><a href="{base_path()}/dashboard">Дашборд</a><a href="{base_path()}/events">События</a><a href="{base_path()}/teams">Команды</a><a href="{base_path()}/participants">Профили</a><a href="{base_path()}/users">Пользователи</a><a href="{base_path()}/settings">Настройки</a><a href="{base_path()}/access-log">Журнал входов</a></nav></header>{content}</main></body></html>''', content_type='text/html')
 
 
 
@@ -317,6 +317,8 @@ def create_app(settings, db=None, bot=None):
     register_metrics(app, DB, ADMIN_USER, page, csrf_token, check_csrf)
     from app.admin_events import register_event_admin
     register_event_admin(app, DB, page, csrf_token, check_csrf, photo, moderation_panel)
+    from app.admin_teams import register_team_admin
+    register_team_admin(app, DB, ADMIN_USER, page, csrf_token, check_csrf)
     app.router.add_post('/participants/{uid}/moderation', moderate)
     register_access_log(app, DB, page)
     if prefix:

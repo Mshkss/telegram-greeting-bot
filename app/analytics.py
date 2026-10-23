@@ -85,10 +85,12 @@ def start_source(text):
 def action_code(event):
     if getattr(event, 'data', None):
         parts = event.data.split(':')
-        if parts[0] == 'menu' and len(parts) == 2 and parts[1] in ('profile','edit','browse','matches','hide','show','delete','events','registrations'):
+        if parts[0] == 'menu' and len(parts) == 2 and parts[1] in ('profile','edit','browse','matches','hide','show','delete','events','registrations','teams'):
             return 'menu_' + parts[1]
         if parts[0] in ('event','events','choose_events','registrations','signup','participant','participant_delete'):
             return parts[0]
+        if parts[0] == 'tm':
+            return 'team_' + parts[1] if len(parts)>1 and parts[1] in ('events','home','profile','create','detail','list','inbox','requests','people','invite','apply','accept','reject','withdraw','transfer','leave','close','remove','visibility') else 'team_button'
         if parts[0] == 'draft':
             return 'draft_button'
         if parts[0] == 'react' and parts[-1] in ('like','skip'):
@@ -96,7 +98,7 @@ def action_code(event):
         return 'other_button'
     text = getattr(event, 'text', None) or ''
     command = text.split(maxsplit=1)[0].split('@')[0] if text else ''
-    if command in ('/start','/profile','/edit','/browse','/matches','/hide','/show','/delete','/cancel','/events','/registrations'):
+    if command in ('/start','/profile','/edit','/browse','/matches','/hide','/show','/delete','/cancel','/events','/registrations','/teams'):
         return command[1:]
     return 'photo' if getattr(event, 'photo', None) else 'message'
 

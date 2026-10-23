@@ -44,6 +44,11 @@ EVENT_LABELS = {
     'profile_fill_cancelled':'Отмена заполнения', 'profile_fill_restarted':'Перезапуск заполнения',
     'profile_fill_resumed':'Продолжение черновика через /start', 'validation_error':'Ошибки заполнения',
     'stale_button':'Нажатия устаревших кнопок', 'registration_paused':'Попытки регистрации во время паузы',
+    'matching_profile_saved':'Профили для команды сохранены','team_created':'Создания команд',
+    'team_application_sent':'Заявки и приглашения в команду','team_application_accepted':'Принятые заявки / приглашения',
+    'team_application_withdrawn':'Отозванные заявки / приглашения','team_application_rejected':'Отклонённые заявки / приглашения','team_left':'Выходы из команды',
+    'team_closed':'Роспуски команд','team_member_removed':'Исключения участников','team_captain_changed':'Смены капитана','team_moderated':'Роспуски модератором',
+    'team_search_shown':'Включения поиска команды','team_search_hidden':'Скрытия из поиска команды',
     'moderation_block':'Блокировки', 'moderation_unblock':'Разблокировки',
 }
 

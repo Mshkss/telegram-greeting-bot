@@ -131,7 +131,11 @@ from app.notices import SCHEMA as NOTICES_SCHEMA
 MIGRATIONS.append((9, NOTICES_SCHEMA))
 
 
-class Database(AnalyticsStore, EventStore):
+from app.teams import TeamStore, SCHEMA as TEAMS_SCHEMA
+MIGRATIONS.append((10, TEAMS_SCHEMA))
+
+
+class Database(AnalyticsStore, EventStore, TeamStore):
     def __init__(self, pool):
         self.pool = pool
 

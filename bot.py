@@ -22,7 +22,7 @@ async def main():
                 raise RuntimeError('Удалите webhook перед запуском polling.')
             await bot.set_my_commands([BotCommand(command=command,description=description) for command,description in [
                 ('start','Главное меню'),('events','События и хакатоны'),('profile','Мой профиль'),
-                ('edit','Заполнить или изменить профиль'),('registrations','Мои записи'),
+                ('edit','Заполнить или изменить профиль'),('registrations','Мои записи'),('teams','Команды моих хакатонов'),
                 ('cancel','Отменить заполнение'),('delete','Удалить профиль и отменить записи')]])
             dp = Dispatcher()
             dp.update.outer_middleware(ActivityMiddleware(db))

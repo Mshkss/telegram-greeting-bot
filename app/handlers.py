@@ -16,7 +16,7 @@ def keyboard(rows):
 def menu():
     return keyboard([[('📅 События','menu:events'),('🎟 Мои записи','menu:registrations')],
         [('👤 Мой профиль','menu:profile'),('✏️ Изменить профиль','menu:edit')],
-        [('🗑 Удалить профиль','menu:delete')]])
+        [('👥 Команды','menu:teams')],[('🗑 Удалить профиль','menu:delete')]])
 
 
 def caption(p):
@@ -80,7 +80,7 @@ async def context_photo(message,file_id,text,replace=False,**kwargs):
 async def prompt(message,draft,replace=False):
     step=draft['step']; cb=lambda v:f"participant:{draft['version']}:{v}"
     texts={'consent':'Бот помогает записываться на хакатоны и другие командные события. Пока регистрация доступна с 18 лет. '
-        'Имя, возраст, фото, стек и ваши записи доступны администратору; публичного каталога людей нет. '
+        'Имя, возраст, фото, стек и ваши записи доступны администратору; для поиска команды можно отдельно открыть имя, стек, роли и опыт другим участникам хакатона. '
         'Фото хранится в Telegram, у нас — file_id. Действия учитываются для аналитики. '
         'При удалении профиля записи отменяются, копия профиля остаётся в закрытом архиве администратора. '
         '/cancel — отменить заполнение.',
@@ -100,6 +100,8 @@ def build_router(db):
     router=Router()
     router.message.filter(F.chat.type=='private',F.from_user,~F.from_user.is_bot)
     router.callback_query.filter(F.message.chat.type=='private',~F.from_user.is_bot)
+    from app.team_handlers import register_team_handlers
+    team_menu=register_team_handlers(router,db,context_text,keyboard,menu)
 
     async def show_event(message,eid,uid,replace=False):
         if not 0<eid<=2**63-1:
@@ -114,6 +116,7 @@ def build_router(db):
         if status=='open':
             rows.append([('🙋 Нужна команда',f'signup:{eid}:yes'),('👥 Команда есть',f'signup:{eid}:no')])
         if reg:
+            rows.append([('👥 Команды и участники',f'tm:home:{eid}')])
             rows.append([('Отменить запись',f'signup:{eid}:cancel')])
         rows.append([('← События','menu:events'),('В меню','menu:home')])
         if row.get('body_html'):
@@ -172,11 +175,13 @@ def build_router(db):
         uid=user.id
         if name=='home': await context_text(message,'Главное меню',replace=replace,reply_markup=menu())
         elif name=='events': await listing(message,replace=replace)
+        elif name=='teams': await team_menu(message,uid,replace=replace)
         elif name=='profile':
             p=await db.participant(uid)
             if p: await context_photo(message,p['photo_file_id'],caption(p),replace=replace,reply_markup=menu())
             else: await context_text(message,'Профиль не заполнен. Нажми «Изменить профиль».',replace=replace,reply_markup=menu())
         elif name=='edit':
+            await db.pool.execute('DELETE FROM team_ui_drafts WHERE user_id=$1',uid)
             if not (await db.settings())['registrations_open'] and not await db.participant(uid):
                 await context_text(message,'Создание новых профилей временно приостановлено.',replace=replace,reply_markup=menu());return
             draft=await db.save_participant_draft(uid,'consent',{'username':user.username})
@@ -194,7 +199,7 @@ def build_router(db):
         else:
             await message.answer('События и команды: выбирай хакатон, заполни профиль и запишись.',reply_markup=menu())
 
-    @router.message(Command('events','profile','edit','registrations','delete'))
+    @router.message(Command('events','profile','edit','registrations','delete','teams'))
     async def command(message): await action(message,message.from_user,message.text.split()[0].split('@')[0][1:])
 
     @router.message(Command('cancel'))

@@ -8,6 +8,7 @@ from app.admin_metrics import esc,table
 from app.events import STATUSES,status_of
 from app.reports import MOSCOW
 from app.post_format import parse_post
+from app.teams import ROLES,EXPERIENCE,HOURS
 from pathlib import Path
 
 
@@ -75,7 +76,7 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
                 WHERE event_id=$1 ORDER BY r.created_at DESC LIMIT 100''',eid)
             counts=await db.pool.fetchrow('SELECT count(*) FILTER(WHERE active) AS total,count(*) FILTER(WHERE active AND needs_team) AS team FROM event_registrations WHERE event_id=$1',eid)
             items=[(f'<a href="{base_path()}/users/{r["user_id"]}">{r["user_id"]}</a>',esc(r['name'] or 'Профиль удалён'),esc(r['username'] or '—'),esc(r['stack'] or '—'), 'Нужна' if r['needs_team'] else 'Есть', 'Записан' if r['active'] else 'Отменена') for r in rows]
-            registrations=f'<section class="card"><h2>Записи</h2><p>Активных: {counts["total"]} · Нужна команда: {counts["team"]}</p><a href="{base_path()}/events/{eid}/registrations.csv">Все записи CSV</a><p>Последние 100 записей; весь список — в CSV.</p>'+table(['Telegram ID','Имя','Username','Стек','Команда','Статус'],items)+'</section>'
+            registrations=f'<section class="card"><h2>Записи</h2><p><a href="{base_path()}/teams?event_id={eid}">Команды этого хакатона →</a></p><p>Активных: {counts["total"]} · Нужна команда: {counts["team"]}</p><a href="{base_path()}/events/{eid}/registrations.csv">Все записи CSV</a><p>Последние 100 записей; весь список — в CSV.</p>'+table(['Telegram ID','Имя','Username','Стек','Команда','Статус'],items)+'</section>'
         heading=f'<label class="event-name">Название для бота <input style="display:block;width:100%;margin-top:8px" name="title" maxlength="120" value="{esc(e.get("title",""))}" required></label><p class="muted">Используется в списке и выборе хакатона. Это поле не добавляется в пост канала.</p><label>Статус <select name="status">{options}</select></label>'
         removal=f'<p><a href="{base_path()}/events/{eid}/delete">Удалить хакатон и записи о нём</a></p>' if eid else ''
         return page('Событие',f'<h1>Пост события</h1><form class="moderation" method="post">{controls}{heading}{fields}</details><button>Сохранить пост</button></form><script src="{base_path()}/post-editor.js" defer></script>'+registrations+removal)
@@ -94,7 +95,7 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
             raise web.HTTPSeeOther(location=admin_url('/events'))
         counts=await db.pool.fetchrow('SELECT count(*) AS total,count(*) FILTER(WHERE active) AS active FROM event_registrations WHERE event_id=$1',eid)
         return page('Удаление хакатона',f'''<h1>Удалить «{esc(e['title'])}»?</h1>
-<p>Будут удалены хакатон, все его записи участников ({counts['total']}, активных: {counts['active']}), версии поста и связанные события аналитики.
+<p>Будут удалены хакатон, все его записи участников ({counts['total']}, активных: {counts['active']}), команды, их состав и заявки, версии поста и связанные события аналитики.
 Профили пользователей сохранятся. Восстановить через админку нельзя. Уже опубликованный пост в Telegram-канале этим действием не удаляется.</p>
 <form method="post"><input type="hidden" name="csrf" value="{csrf_token(request,eid,'delete_event')}">
 <input type="hidden" name="revision" value="{e['revision']}"><button class="danger">Удалить хакатон и записи</button>
@@ -124,8 +125,13 @@ def register_event_admin(app,db_key,page,csrf_token,check_csrf,photo,moderation_
         if uid:
             p=await db.participant(uid)
             if not p: raise web.HTTPNotFound(text='Профиль не найден')
+            matching=await db.pool.fetchrow('SELECT * FROM matching_profiles WHERE user_id=$1',uid)
+            preferences=await db.pool.fetch('''SELECT f.*,e.title,t.id AS team_id,t.name AS team_name FROM event_preferences f JOIN events e ON e.id=f.event_id
+                LEFT JOIN team_members m ON m.user_id=f.user_id AND m.event_id=f.event_id LEFT JOIN teams t ON t.id=m.team_id WHERE f.user_id=$1 ORDER BY f.event_id DESC''',uid)
+            info=f'<p>Роли: {esc(", ".join(ROLES[r] for r in matching["roles"]))} · {esc(EXPERIENCE[matching["experience"]])}</p>' if matching else '<p>Профиль для поиска команды не заполнен.</p>'
+            info+=table(['Событие','Роли','Время','Команда'],[(esc(f['title']),esc(', '.join(ROLES[r] for r in f['roles'])),esc(HOURS[f['hours']]),f'<a href="{base_path()}/teams/{f["team_id"]}">{esc(f["team_name"])}</a>' if f['team_id'] else '—') for f in preferences])
             moderation=await moderation_panel(request,uid,f'/participants/{uid}/moderation')
-            return page(p['name'],f'<h1>{esc(p["name"])}, {p["age"]}</h1><img src="{base_path()}/participants/{uid}/photo" alt="Фото участника"><p>Стек: {esc(p["stack"])}</p><a href="{base_path()}/users/{uid}">История действий</a>'+moderation)
+            return page(p['name'],f'<h1>{esc(p["name"])}, {p["age"]}</h1><img src="{base_path()}/participants/{uid}/photo" alt="Фото участника"><p>Стек: {esc(p["stack"])}</p><a href="{base_path()}/users/{uid}">История действий</a>'+info+moderation)
         try: n=max(1,min(100000,int(request.query.get('page','1'))))
         except ValueError: raise web.HTTPBadRequest()
         q=request.query.get('q','').strip()[:100]

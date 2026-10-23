@@ -105,6 +105,12 @@ class EventStore:
             elif draft:
                 await c.execute("UPDATE analytics_attempts SET status=$2,last_activity=now() WHERE id=$1",draft['attempt_id'],'deleted' if delete else 'cancelled')
             if delete:
+                from app.teams import detach_member
+                registrations=await c.fetch('SELECT event_id FROM event_registrations WHERE user_id=$1 ORDER BY event_id',uid)
+                for registration in registrations:
+                    await c.fetchrow('SELECT id FROM events WHERE id=$1 FOR UPDATE',registration['event_id'])
+                    await detach_member(c,registration['event_id'],uid)
+                await c.execute('DELETE FROM team_ui_drafts WHERE user_id=$1',uid)
                 profile=await c.fetchval('SELECT to_jsonb(p) FROM participants p WHERE user_id=$1',uid)
                 if profile or draft:
                     await c.execute('INSERT INTO participant_archives(user_id,snapshot) VALUES($1,$2)',uid,json.dumps({'profile':json.loads(profile) if profile else None,'draft':json.loads(draft['data']) if draft else None}))
@@ -180,6 +186,7 @@ class EventStore:
             row=await c.fetchrow('SELECT revision FROM events WHERE id=$1 FOR UPDATE',eid)
             if not row: raise LookupError('Событие не найдено')
             if row['revision']!=revision: raise ValueError('Событие изменилось. Откройте подтверждение удаления заново.')
+            await c.execute("DELETE FROM team_ui_drafts WHERE data->>'eid'=$1",str(eid))
             await c.execute('DELETE FROM event_registrations WHERE event_id=$1',eid)
             await c.execute('DELETE FROM event_revisions WHERE event_id=$1',eid)
             await c.execute("DELETE FROM analytics_events WHERE properties->>'event_id'=$1",str(eid))
@@ -196,10 +203,15 @@ class EventStore:
                     'was_active':bool(old and old['active']),'cancelled':cancel}
             if cancel:
                 if old and old['active']:
+                    from app.teams import detach_member
+                    await detach_member(c,eid,uid)
+                    await c.execute("DELETE FROM team_ui_drafts WHERE user_id=$1 AND data->>'eid'=$2",uid,str(eid))
                     result['changed']=True
                     await c.execute('UPDATE event_registrations SET active=false,updated_at=now() WHERE event_id=$1 AND user_id=$2',eid,uid)
                     await event(c,'event_registration_cancelled',uid,{'event_id':eid})
                 return result
+            if needs_team and await c.fetchval('SELECT 1 FROM team_members WHERE event_id=$1 AND user_id=$2',eid,uid):
+                raise ValueError('Сначала выйди из команды, чтобы искать новую.')
             if type(needs_team) is not bool: raise ValueError('Выберите, нужна ли команда')
             if status_of(row)!='open': raise ValueError('Регистрация уже закрыта')
             if await c.fetchval('SELECT blocked FROM user_moderation WHERE user_id=$1',uid): raise ValueError('Запись ограничена модератором')
